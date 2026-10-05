@@ -67,7 +67,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **STS — `GetAccessKeyInfo` answers the account that owns the key** — it always returned the caller's account; it now returns the owning account for known keys, or decodes it from the key id for any `AKIA`/`ASIA` key as AWS does, and returns `ValidationError` for a key id that encodes no account or violates constraints. Contributed by @iot-rocket.
 - **STS — `GetAccessKeyInfo` is authorized like other actions** — under `AUTH=true` it was allowed like `GetCallerIdentity` and `GetSessionToken`, whatever the caller's policies said. It now needs an identity policy that allows it and no deny, and otherwise answers `AccessDenied`, as AWS does; the other two stay allowed. Contributed by @iot-rocket.
 - **SNS — `CreateTopic` keeps its tags** — the handler read `Tag.member.N` where the API sends `Tags.member.N`, so tags given at creation were dropped. Contributed by @iot-rocket.
-- **SNS — body-scoped filter policies match nested JSON and string operators** — `MessageBody` subscriptions now filter against nested JSON objects instead of delivering every message, and `suffix` / `equals-ignore-case` policies match their documented values. Reported by @DimQ1.
 
 ## [1.5.21] — 2026-10-03
 
