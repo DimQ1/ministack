@@ -13,13 +13,20 @@ import time
 import types
 import uuid
 import uuid as _uuid_mod
+import xml.etree.ElementTree as _imm_ET
 import zipfile
+from urllib.parse import urlencode as _imm_urlencode
 
 import boto3
 import pytest
+from botocore.awsrequest import AWSResponse as _ImmAWSResponse
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from conftest import ENDPOINT
+
+from ministack.core.responses import AccountRegionScopedDict as _ImmScopedDict
+from ministack.core.responses import request_scope as _imm_request_scope
+from ministack.services import rds as _imm_rds
 
 DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
@@ -16474,3 +16481,225 @@ def test_rds_public_endpoint_cluster_reports_published_port(monkeypatch):
     finally:
         m._instances.clear()
         m._clusters.clear()
+
+
+# ---------------------------------------------------------------------------
+# ModifyDBInstance settings that apply immediately (synthetic instances)
+# ---------------------------------------------------------------------------
+
+_IMM_FLAGS = ("DeletionProtection", "CopyTagsToSnapshot")
+_IMM_ACCOUNT = "111111111111"
+_IMM_REGION = "us-east-1"
+
+
+@pytest.fixture
+def imm_state(monkeypatch):
+    monkeypatch.setattr(_imm_rds, "_instances", _ImmScopedDict())
+    monkeypatch.setattr(_imm_rds, "_clusters", _ImmScopedDict())
+    monkeypatch.setattr(_imm_rds, "_tags", _ImmScopedDict())
+    with _imm_request_scope(_IMM_ACCOUNT, _IMM_REGION):
+        yield
+
+
+def _imm_instance(**values):
+    instance = {
+        "DBInstanceIdentifier": "immediate-settings",
+        "DBInstanceArn": f"arn:aws:rds:{_IMM_REGION}:{_IMM_ACCOUNT}:db:immediate-settings",
+        "DBInstanceStatus": "available", "MasterUsername": "admin",
+        "InstanceCreateTime": "2026-01-01T00:00:00Z",
+        "Engine": "postgres", "EngineVersion": "16.3",
+        "AllocatedStorage": 20, "DBInstanceClass": "db.t4g.small",
+        "PendingModifiedValues": {},
+        "DeletionProtection": False, "CopyTagsToSnapshot": False,
+    }
+    instance.update(values)
+    _imm_rds._instances[instance["DBInstanceIdentifier"]] = instance
+    return instance
+
+
+def _imm_query(action, **params):
+    body = _imm_urlencode({"Action": action, "Version": "2014-10-31", **params}).encode()
+    status, headers, body = asyncio.run(_imm_rds.handle_request(
+        "POST", "/", {"content-type": "application/x-www-form-urlencoded"}, body, {},
+    ))
+    assert status == 200, body
+    return status, headers, body.encode() if isinstance(body, str) else body
+
+
+class _ImmRawResponse(io.BytesIO):
+    def stream(self, amt=None, decode_content=False):
+        yield self.read()
+
+
+def _imm_sdk():
+    # The before-send transport uses production Query dispatch and XML. An
+    # accidentally unhandled request goes to a refusal endpoint, never AWS.
+    client = boto3.client(
+        "rds", endpoint_url="http://127.0.0.1:9", region_name=_IMM_REGION,
+        aws_access_key_id=_IMM_ACCOUNT, aws_secret_access_key="test",
+        config=Config(retries={"max_attempts": 0}),
+    )
+
+    def send(request, **kwargs):
+        status, headers, body = asyncio.run(_imm_rds.handle_request(
+            "POST", "/", {"content-type": "application/x-www-form-urlencoded"},
+            request.body, {},
+        ))
+        body = body.encode() if isinstance(body, str) else body
+        return _ImmAWSResponse(request.url, status, headers, _ImmRawResponse(body))
+
+    client.meta.events.register("before-send.rds", send)
+    return client
+
+
+def _imm_modify_readback(mode, **params):
+    if mode == "sdk":
+        client = _imm_sdk()
+        changed = client.modify_db_instance(
+            DBInstanceIdentifier="immediate-settings", **params,
+        )["DBInstance"]
+        described = client.describe_db_instances(
+            DBInstanceIdentifier="immediate-settings",
+        )["DBInstances"][0]
+        return changed, described
+
+    query_params = {key: str(value).lower() if isinstance(value, bool) else value
+                    for key, value in params.items()}
+    outputs = []
+    for action in ("ModifyDBInstance", "DescribeDBInstances"):
+        _, _, body = _imm_query(
+            action, DBInstanceIdentifier="immediate-settings",
+            **(query_params if action == "ModifyDBInstance" else {}),
+        )
+        instance = _imm_ET.fromstring(body).find(".//{*}DBInstance")
+        outputs.append({
+            **{flag: instance.findtext(f"{{*}}{flag}") == "true" for flag in _IMM_FLAGS},
+            "PendingModifiedValues": {
+                child.tag.split("}")[-1]: child.text
+                for child in instance.find("{*}PendingModifiedValues")
+            },
+        })
+    return outputs
+
+
+@pytest.mark.parametrize("mode", ["sdk", "query"])
+@pytest.mark.parametrize("apply", [None, False, True])
+@pytest.mark.parametrize("desired", [False, True])
+@pytest.mark.parametrize("flag", _IMM_FLAGS)
+def test_rds_standalone_flags_apply_immediately(imm_state, mode, apply, desired, flag):
+    instance = _imm_instance(**{flag: not desired})
+    params = {flag: desired}
+    if apply is not None:
+        params["ApplyImmediately"] = apply
+    for output in _imm_modify_readback(mode, **params):
+        assert output[flag] is desired
+        assert not set(_IMM_FLAGS).intersection(output["PendingModifiedValues"])
+    assert instance[flag] is desired
+    assert instance["PendingModifiedValues"] == {}
+
+
+@pytest.mark.parametrize("mode", ["sdk", "query"])
+@pytest.mark.parametrize("apply", [None, False, True])
+def test_rds_both_flags_repeated_updates_preserve_omitted_values(imm_state, mode, apply):
+    _imm_instance()
+    params = {} if apply is None else {"ApplyImmediately": apply}
+    for desired in (True, False, True):
+        for output in _imm_modify_readback(mode, **params, **dict.fromkeys(_IMM_FLAGS, desired)):
+            assert all(output[flag] is desired for flag in _IMM_FLAGS)
+            assert output["PendingModifiedValues"] == {}
+    for output in _imm_modify_readback(mode, **params, DeletionProtection=False):
+        assert output["DeletionProtection"] is False
+        assert output["CopyTagsToSnapshot"] is True
+    for output in _imm_modify_readback(mode, **params, CopyTagsToSnapshot=False):
+        assert all(output[flag] is False for flag in _IMM_FLAGS)
+
+
+@pytest.mark.parametrize("flag", _IMM_FLAGS)
+def test_rds_flag_only_request_preserves_unrelated_pending_changes(imm_state, flag):
+    pending = {"DBInstanceClass": "db.t4g.medium", "AllocatedStorage": 30}
+    instance = _imm_instance(PendingModifiedValues=pending.copy())
+    for output in _imm_modify_readback("sdk", ApplyImmediately=False, **{flag: True}):
+        assert output[flag] is True
+        assert output["PendingModifiedValues"] == pending
+    assert instance["PendingModifiedValues"] == pending
+
+
+@pytest.mark.parametrize("apply", [None, False, True])
+def test_rds_immediate_protection_blocks_delete_and_disabling_allows_it(imm_state, monkeypatch, apply):
+    monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+    _imm_instance()
+    client = _imm_sdk()
+    params = {} if apply is None else {"ApplyImmediately": apply}
+    client.modify_db_instance(
+        DBInstanceIdentifier="immediate-settings", DeletionProtection=True, **params,
+    )
+    with pytest.raises(ClientError) as error:
+        client.delete_db_instance(
+            DBInstanceIdentifier="immediate-settings", SkipFinalSnapshot=True,
+        )
+    assert error.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert client.describe_db_instances(
+        DBInstanceIdentifier="immediate-settings",
+    )["DBInstances"][0]["DeletionProtection"] is True
+    client.modify_db_instance(
+        DBInstanceIdentifier="immediate-settings", DeletionProtection=False, **params,
+    )
+    assert client.delete_db_instance(
+        DBInstanceIdentifier="immediate-settings", SkipFinalSnapshot=True,
+    )["DBInstance"]["DBInstanceStatus"] == "deleting"
+    with pytest.raises(ClientError) as error:
+        client.describe_db_instances(DBInstanceIdentifier="immediate-settings")
+    assert error.value.response["Error"]["Code"] == "DBInstanceNotFound"
+    assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_rds_flags_do_not_create_a_missing_instance(imm_state):
+    with pytest.raises(ClientError) as error:
+        _imm_sdk().modify_db_instance(
+            DBInstanceIdentifier="missing-settings", DeletionProtection=True,
+            CopyTagsToSnapshot=True,
+        )
+    assert error.value.response["Error"]["Code"] == "DBInstanceNotFound"
+    assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert not _imm_rds._instances
+
+
+def test_rds_immediate_flags_are_isolated_by_account_and_region(imm_state):
+    tenants = [(_IMM_ACCOUNT, _IMM_REGION), ("222222222222", _IMM_REGION), (_IMM_ACCOUNT, "eu-west-1")]
+    for account, region in tenants:
+        with _imm_request_scope(account, region):
+            _imm_instance()
+    _imm_modify_readback("sdk", ApplyImmediately=False, **dict.fromkeys(_IMM_FLAGS, True))
+    for account, region in tenants:
+        with _imm_request_scope(account, region):
+            output = _imm_sdk().describe_db_instances(
+                DBInstanceIdentifier="immediate-settings",
+            )["DBInstances"][0]
+            assert all(output[flag] is ((account, region) == tenants[0]) for flag in _IMM_FLAGS)
+
+
+@pytest.mark.parametrize("membership", ["DBClusterIdentifier", "_shared_cluster_id", None])
+def test_rds_cluster_member_settings_also_apply_immediately(imm_state, membership):
+    instance = _imm_instance(Engine="aurora-postgresql", **({membership: "cluster"} if membership else {}))
+    _imm_modify_readback("sdk", ApplyImmediately=False, **dict.fromkeys(_IMM_FLAGS, True))
+    assert all(instance[flag] is True for flag in _IMM_FLAGS)
+    assert instance["PendingModifiedValues"] == {}
+
+
+@pytest.mark.parametrize("param, value, stored", [
+    ("PreferredBackupWindow", "03:00-04:00", "03:00-04:00"),
+    ("PreferredMaintenanceWindow", "sun:05:00-sun:06:00", "sun:05:00-sun:06:00"),
+    ("PubliclyAccessible", "true", True),
+    ("MaxAllocatedStorage", "100", 100),
+    ("MonitoringInterval", "60", 60),
+    ("MonitoringRoleArn", "arn:aws:iam::111111111111:role/mon", "arn:aws:iam::111111111111:role/mon"),
+])
+def test_rds_settings_outside_pending_modified_values_apply_immediately(imm_state, param, value, stored):
+    """botocore's PendingModifiedValues has no member for these, so they never queue."""
+    instance = _imm_instance()
+    status, _, _ = _imm_rds._modify_db_instance(
+        {"DBInstanceIdentifier": ["immediate-settings"], param: [value], "ApplyImmediately": ["false"]})
+    assert status == 200
+    assert instance[param] == stored
+    assert instance["PendingModifiedValues"] == {}
