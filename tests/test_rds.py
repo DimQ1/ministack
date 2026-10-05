@@ -4132,7 +4132,7 @@ def test_rds_empty_cluster_applies_pending_password_on_restart(
         rotations.append((old_password, new_password))
         return rotation_succeeds
 
-    def _grant(_host, _port, user, password, db_id):
+    def _grant(_host, _port, user, password, db_id, _engine=""):
         grants.append((user, password, db_id))
 
     monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
@@ -4473,8 +4473,26 @@ def test_rds_delete_cluster_rejects_attached_members(monkeypatch):
         m._clusters.clear()
 
 
-def test_rds_mysql_master_user_privilege_grants(monkeypatch):
-    """MySQL master users get admin grants, with dynamic grants best-effort."""
+_AURORA_MYSQL_3_EXTRAS = (
+    "CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "CONNECTION_ADMIN", "ROLE_ADMIN",
+    "XA_RECOVER_ADMIN", "SHOW_ROUTINE", "FLUSH_OPTIMIZER_COSTS", "FLUSH_STATUS", "FLUSH_TABLES",
+    "FLUSH_USER_RESOURCES",
+)
+
+
+@pytest.mark.parametrize("engine, server_version, extras", [
+    ("mysql", "8.0.35", ()),
+    ("mysql", "8.4.5", ("CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "ROLE_ADMIN",
+                        "SET_USER_ID", "XA_RECOVER_ADMIN")),
+    ("mariadb", "10.11.8-MariaDB", ()),
+    ("mariadb", "11.4.2-MariaDB-ubu2404", ("SHOW CREATE ROUTINE",)),
+    ("aurora-mysql", "5.7.44", ("LOAD FROM S3", "SELECT INTO S3")),
+    ("aurora-mysql", "8.0.39", _AURORA_MYSQL_3_EXTRAS + ("SET_USER_ID",)),
+    ("aurora-mysql", "8.4.5", _AURORA_MYSQL_3_EXTRAS + (
+        "ALLOW_NONEXISTENT_DEFINER", "FLUSH_PRIVILEGES", "OPTIMIZE_LOCAL_TABLE", "SET_ANY_DEFINER")),
+])
+def test_rds_mysql_master_user_privilege_grants(monkeypatch, engine, server_version, extras):
+    """The master user gets the privileges in AWS's master user table for its engine and version, and no others."""
     import sys
     import types
 
@@ -4487,6 +4505,9 @@ def test_rds_mysql_master_user_privilege_grants(monkeypatch):
             calls.append((sql, params))
             if "APPLICATION_PASSWORD_ADMIN" in sql:
                 raise Exception("unsupported privilege")
+
+        def fetchone(self):
+            return (server_version,)
 
         def close(self):
             calls.append(("cursor.close", None))
@@ -4509,7 +4530,7 @@ def test_rds_mysql_master_user_privilege_grants(monkeypatch):
     )
 
     m._grant_mysql_master_user_privileges(
-        "10.0.0.12", 3306, "admin", "password123", "mysql-test")
+        "10.0.0.12", 3306, "admin", "password123", "mysql-test", engine)
 
     assert calls[0] == (
         "connect",
@@ -4525,10 +4546,11 @@ def test_rds_mysql_master_user_privilege_grants(monkeypatch):
         "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
         ("admin", "password123"),
     ) in calls
-    assert (
-        "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
-        ("admin",),
-    ) in calls
+    grants = [sql for sql, _params in calls if isinstance(sql, str) and sql.startswith("GRANT ")]
+    assert grants == [f"GRANT {m._MYSQL_MASTER_PRIVILEGES} ON *.* TO %s@'%%' WITH GRANT OPTION"] + [
+        f"GRANT {privilege} ON *.* TO %s@'%%' WITH GRANT OPTION" for privilege in extras]
+    assert ("REVOKE ALL PRIVILEGES, GRANT OPTION FROM %s@'%%'", ("admin",)) in calls
+    assert not any("ALL PRIVILEGES ON" in str(sql) for sql, _params in calls)
     assert ("FLUSH PRIVILEGES", None) in calls
 
 
@@ -5300,7 +5322,7 @@ def test_rds_deferred_mysql_start_grants_master_privileges(monkeypatch):
     m._instances[db_id] = instance
     try:
         m._start_rds_container_for_instance(db_id, instance)
-        assert grants == [("127.0.0.1", 15600, "admin", "password123", db_id)]
+        assert grants == [("127.0.0.1", 15600, "admin", "password123", db_id, "mysql")]
         assert instance["DBInstanceStatus"] == "available"
     finally:
         m._instances.clear()
@@ -5471,7 +5493,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
         rotations.append((old_password, new_password))
         return True
 
-    def _grant(_host, _port, user, password, db_id):
+    def _grant(_host, _port, user, password, db_id, _engine=""):
         grants.append((user, password, db_id))
 
     def _configure_replication(db_id, cluster):

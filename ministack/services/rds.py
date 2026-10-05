@@ -895,6 +895,7 @@ def _restore_state(data, *, resume_runtime=False):
                             cluster.get("MasterUsername", "admin"),
                             cluster.get("_MasterUserPassword", "password"),
                             cluster_id,
+                            cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
@@ -2537,7 +2538,7 @@ def _start_rds_container_for_instance(db_id, instance):
             return
         _grant_mysql_master_user_privileges(
             internal_host or "127.0.0.1", internal_port or host_port,
-            master_user, master_pass, db_id,
+            master_user, master_pass, db_id, engine,
         )
     _instance_available_unless_stopped(instance)
     logger.info("RDS: respawned container %s for instance %s",
@@ -3769,8 +3770,39 @@ def _configure_or_defer_mysql_replication(cluster_id, cluster):
         _schedule_mysql_replication_retry(cluster_id, cluster)
 
 
-def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id):
-    """Grant the emulated MySQL master user AWS/RDS-like admin privileges."""
+_MYSQL_MASTER_PRIVILEGES = (
+    "SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, REFERENCES, "
+    "INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, "
+    "REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, "
+    "ALTER ROUTINE, CREATE USER, EVENT, TRIGGER"
+)
+_AURORA_MYSQL_3_MASTER_PRIVILEGES = (
+    "CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "CONNECTION_ADMIN",
+    "ROLE_ADMIN", "XA_RECOVER_ADMIN", "SHOW_ROUTINE", "FLUSH_OPTIMIZER_COSTS",
+    "FLUSH_STATUS", "FLUSH_TABLES", "FLUSH_USER_RESOURCES",
+)
+
+
+def _mysql_master_extra_privileges(engine, server_version):
+    """Master-user privileges beyond _MYSQL_MASTER_PRIVILEGES, per the RDS and Aurora master user tables."""
+    version = tuple(int(n) for n in re.findall(r"\d+", server_version)[:3])
+    if "mariadb" in server_version.lower():
+        return ("SHOW CREATE ROUTINE",) if version >= (11, 4) else ()
+    if engine.startswith("aurora"):
+        if version < (8,):
+            return ("LOAD FROM S3", "SELECT INTO S3")
+        if version >= (8, 4):
+            return _AURORA_MYSQL_3_MASTER_PRIVILEGES + (
+                "ALLOW_NONEXISTENT_DEFINER", "FLUSH_PRIVILEGES", "OPTIMIZE_LOCAL_TABLE", "SET_ANY_DEFINER")
+        return _AURORA_MYSQL_3_MASTER_PRIVILEGES + ("SET_USER_ID",)
+    if version >= (8, 0, 36):
+        return ("CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "ROLE_ADMIN",
+                "SET_USER_ID", "XA_RECOVER_ADMIN")
+    return ()
+
+
+def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id, engine=""):
+    """Grant the emulated MySQL master user the privileges AWS gives it, and no others."""
     try:
         import pymysql
         conn = pymysql.connect(
@@ -3781,13 +3813,17 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
             (master_user, master_pass),
         )
+        if master_user != "root":
+            cur.execute("REVOKE ALL PRIVILEGES, GRANT OPTION FROM %s@'%%'", (master_user,))
         cur.execute(
-            "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
+            f"GRANT {_MYSQL_MASTER_PRIVILEGES} ON *.* TO %s@'%%' WITH GRANT OPTION",
             (master_user,),
         )
-        for privilege in ("APPLICATION_PASSWORD_ADMIN",):
+        cur.execute("SELECT VERSION()")
+        server_version = cur.fetchone()[0]
+        for privilege in _mysql_master_extra_privileges(engine or "", server_version):
             try:
-                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%'", (master_user,))
+                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%' WITH GRANT OPTION", (master_user,))
             except Exception as e:
                 logger.debug(
                     "RDS: MySQL privilege %s unsupported for %s: %s",
@@ -5085,7 +5121,7 @@ def _create_db_instance_impl(p):
                         _grant_mysql_master_user_privileges(
                             ready_host, ready_port, master_user,
                             cluster.get("_MasterUserPassword", master_pass),
-                            cluster_id,
+                            cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
                     if _aurora_mysql_8_replication_enabled(cluster):
@@ -5126,7 +5162,7 @@ def _create_db_instance_impl(p):
             if _is_mysql_engine(engine):
                 _grant_mysql_master_user_privileges(
                     ready_host, ready_port, master_user, master_pass,
-                    cluster_id or db_id,
+                    cluster_id or db_id, engine,
                 )
             inst = _instances.get(db_id)
             if inst is not None:
@@ -7148,7 +7184,7 @@ def _start_db_cluster(p):
                     _grant_mysql_master_user_privileges(
                         ready_host, ready_port, master_user,
                         cluster.get("_MasterUserPassword", master_pass),
-                        cluster_id,
+                        cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
                 if _aurora_mysql_8_replication_enabled(cluster):
