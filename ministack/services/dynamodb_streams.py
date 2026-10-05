@@ -12,6 +12,7 @@ shard per stream; no duplicate storage).
 import base64
 import json
 import logging
+import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import error_response_json, get_account_id, get_region, json_response
@@ -28,6 +29,7 @@ _ITERATOR_TYPES = {
     "AT_SEQUENCE_NUMBER",
     "AFTER_SEQUENCE_NUMBER",
 }
+_ITERATOR_TTL_SECONDS = 15 * 60
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -71,7 +73,12 @@ def _encode_iterator(
     it back unmodified. We base64-url-encode a small JSON payload so it stays
     short enough to fit in AWS's 2 KB iterator limit.
     """
-    payload_data = {"t": table_name, "s": shard_id, "p": position}
+    payload_data = {
+        "t": table_name,
+        "s": shard_id,
+        "p": position,
+        "issued_at": time.time(),
+    }
     if account_id:
         payload_data["a"] = account_id
     if region:
@@ -366,6 +373,7 @@ def _get_records(data):
     table_name = decoded["t"]
     shard_id = decoded.get("s", _DEFAULT_SHARD_ID)
     position = int(decoded.get("p", 0))
+    issued_at = decoded.get("issued_at")
     account_id = decoded.get("a", get_account_id())
     region = decoded.get("r", get_region())
     stream_arn = decoded.get("arn")
@@ -373,6 +381,11 @@ def _get_records(data):
     if account_id != get_account_id() or region != get_region():
         return error_response_json(
             "ValidationException", "ShardIterator is not valid", 400
+        )
+    if (not isinstance(issued_at, (int, float))
+            or time.time() - issued_at >= _ITERATOR_TTL_SECONDS):
+        return error_response_json(
+            "ExpiredIteratorException", "ShardIterator has expired", 400
         )
 
     info = _enabled_stream_info(table_name, account_id=account_id, region=region)

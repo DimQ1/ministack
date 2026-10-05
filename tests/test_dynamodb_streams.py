@@ -544,3 +544,49 @@ def test_records_expire_on_read_without_further_writes(streams_state):
     assert _seqs(_json(streams_service._get_records({
         "ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON"),
     }))) == ["1"]
+
+
+def test_shard_iterator_expires_after_fifteen_minutes(streams_state, monkeypatch):
+    ddb_service, streams_service, time = streams_state
+    name = "streams-iterator-expiry"
+    arn = _streamed_table(ddb_service, name)
+    now = time.time()
+    ddb_service._stream_records[name] = [_record(0, now)]
+    monkeypatch.setattr(streams_service.time, "time", lambda: now)
+
+    iterator = _iterator(streams_service, arn, "TRIM_HORIZON")
+    monkeypatch.setattr(
+        streams_service.time,
+        "time",
+        lambda: now + streams_service._ITERATOR_TTL_SECONDS,
+    )
+
+    response = streams_service._get_records({"ShardIterator": iterator})
+
+    assert response[0] == 400
+    assert _json(response)["__type"].endswith("ExpiredIteratorException")
+
+
+def test_next_shard_iterator_has_a_fresh_expiry_window(streams_state, monkeypatch):
+    ddb_service, streams_service, time = streams_state
+    name = "streams-next-iterator-expiry"
+    arn = _streamed_table(ddb_service, name)
+    now = time.time()
+    ddb_service._stream_records[name] = [_record(0, now)]
+    monkeypatch.setattr(streams_service.time, "time", lambda: now)
+
+    iterator = _iterator(streams_service, arn, "TRIM_HORIZON")
+    before_expiry = now + streams_service._ITERATOR_TTL_SECONDS - 1
+    monkeypatch.setattr(streams_service.time, "time", lambda: before_expiry)
+    first_page = _json(streams_service._get_records({"ShardIterator": iterator}))
+
+    monkeypatch.setattr(
+        streams_service.time,
+        "time",
+        lambda: before_expiry + streams_service._ITERATOR_TTL_SECONDS - 1,
+    )
+    second_page = _json(
+        streams_service._get_records({"ShardIterator": first_page["NextShardIterator"]})
+    )
+
+    assert second_page["Records"] == []
