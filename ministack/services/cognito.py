@@ -2772,7 +2772,7 @@ def _get_ui_customization(data):
     if err:
         return err
     ui = pool.get("_ui_customizations", {})
-    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {"UserPoolId": pool["Id"], "ClientId": cid}})
+    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {}})
 
 
 # ---------------------------------------------------------------------------

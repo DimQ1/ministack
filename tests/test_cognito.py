@@ -113,6 +113,8 @@ def test_cognito_ui_customization(cognito_idp):
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
 
     cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"ui-{pid.split('_')[1].lower()}")
+    assert cognito_idp.get_ui_customization(UserPoolId=pid)["UICustomization"] == {}
+    assert cognito_idp.get_ui_customization(UserPoolId=pid, ClientId=cid)["UICustomization"] == {}
     pool_ui = cognito_idp.set_ui_customization(UserPoolId=pid, CSS=".banner-customizable {}")["UICustomization"]
     assert pool_ui["ClientId"] == "ALL" and pool_ui["CSS"] == ".banner-customizable {}" and pool_ui["CSSVersion"]
     assert cognito_idp.get_ui_customization(UserPoolId=pid, ClientId=cid)["UICustomization"]["CSS"] == pool_ui["CSS"]
