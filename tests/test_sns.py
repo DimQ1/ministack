@@ -1990,21 +1990,14 @@ def _seed_internal_topic(_sns, name, *, attributes=None, subscriptions=()):
     _sns._topics[arn] = {
         "name": name,
         "arn": arn,
-        "messages": [],
         "subscriptions": list(subscriptions),
         "attributes": attributes or {},
     }
     return arn
 
 
-def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monkeypatch):
-    """A publish through the seam gets everything an HTTP one gets.
-
-    The message_structure and message_attributes here are the two fields the
-    hand-rolled `topic["messages"].append(...)` this replaced used to drop, and
-    both are load-bearing: the first picks the per-protocol body, the second is
-    what a subscription filter policy reads.
-    """
+def test_sns_publish_internal_fans_out_without_storing_message(sns_internal, monkeypatch):
+    """Publish metadata is returned and delivered without retaining the body."""
     delivered = []
     monkeypatch.setattr(
         sns_internal,
@@ -2036,14 +2029,33 @@ def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monke
     assert result["sequence_number"] is None
     assert result["message_id"]
 
-    stored = sns_internal._topics[arn]["messages"]
-    assert len(stored) == 1
-    assert stored[0]["id"] == result["message_id"]
-    assert stored[0]["subject"] == "a subject"
-    assert stored[0]["message_structure"] == "json"
-    assert stored[0]["message_attributes"] == attrs
+    assert "messages" not in sns_internal._topics[arn]
     # message_structure picked the sqs body rather than the default one.
     assert delivered == ["for-sqs"]
+
+
+def test_sns_state_discards_legacy_topic_messages(sns_internal):
+    arn = _seed_internal_topic(sns_internal, f"legacy-{_uuid_mod.uuid4().hex[:8]}")
+    legacy_message = {"id": "old-id", "message": "old payload"}
+
+    sns_internal.load_persisted_state({
+        "topics": {
+            arn: {
+                "name": "legacy",
+                "arn": arn,
+                "attributes": {},
+                "subscriptions": [],
+                "messages": [legacy_message],
+                "tags": {},
+            },
+        },
+    })
+
+    assert "messages" not in sns_internal._topics[arn]
+
+    # Even an in-memory legacy topic must not copy its payload into a snapshot.
+    sns_internal._topics[arn]["messages"] = [legacy_message]
+    assert "messages" not in sns_internal.get_state()["topics"][arn]
 
 
 def test_sns_publish_internal_applies_the_subscription_filter_policy(
@@ -2291,8 +2303,8 @@ def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     assert second["duplicate"] is True
     assert second["message_id"] == first["message_id"]
     assert second["sequence_number"] == first["sequence_number"]
-    # ...and neither the store nor the subscriber saw it twice.
-    assert len(sns_internal._topics[arn]["messages"]) == 1
+    # ...and the subscriber saw it once without retaining the topic payload.
+    assert "messages" not in sns_internal._topics[arn]
     assert delivered == ["once"]
 
     # A different dedup id inside the same group is a new message.
@@ -2301,7 +2313,8 @@ def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     )
     assert third["duplicate"] is False
     assert third["sequence_number"] == "2".zfill(20)
-    assert len(sns_internal._topics[arn]["messages"]) == 2
+    assert "messages" not in sns_internal._topics[arn]
+    assert delivered == ["once", "twice"]
 
 
 def test_sns_publish_internal_rejections(sns_internal):

@@ -729,6 +729,9 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
     independent subscriptions — a table can have either, both, or neither.
     Each path is gated independently here; the function name is kept for
     backwards compatibility with existing call sites."""
+    if event_name == "MODIFY" and _ddb_items_equal(old_item, new_item):
+        return
+
     table = _tables.get(table_name)
     if not table:
         return
@@ -3396,6 +3399,7 @@ def _execute_transaction(data):
     crt = data.get("ClientRequestToken")
     signature = None
     if crt:
+        _prune_txn_idempotency()
         prior = _txn_idempotency.get(crt)
         signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
         if prior is not None:
@@ -3520,7 +3524,8 @@ def _execute_transaction(data):
                              "WriteCapacityUnits": write_units})
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
+        _txn_idempotency[crt] = {"created_at": time.time(), "signature": signature,
+                                 "response": result, "sizes": txn_sizes}
     return json_response(result)
 
 
@@ -4241,6 +4246,7 @@ def _transact_write_items(data):
     # raises IdempotentParameterMismatchException.
     crt = data.get("ClientRequestToken")
     if crt:
+        _prune_txn_idempotency()
         prior = _txn_idempotency.get(crt)
         # Drop the ClientRequestToken from the payload signature so equality
         # is on the actual transaction body.
@@ -4471,11 +4477,19 @@ def _transact_write_items(data):
     if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
+        _txn_idempotency[crt] = {"created_at": time.time(), "signature": signature,
+                                 "response": result, "sizes": txn_sizes}
     return json_response(result)
 
 
 _txn_idempotency = AccountRegionScopedDict()
+
+
+def _prune_txn_idempotency() -> None:
+    cutoff = time.time() - 600
+    for token, entry in list(_txn_idempotency.items()):
+        if entry.get("created_at", 0) <= cutoff:
+            _txn_idempotency.pop(token, None)
 
 
 def _transact_get_items(data):
@@ -6809,10 +6823,6 @@ def _remove_at_path(item, path_parts):
 
 def _compare_ddb(left, op, right):
     if left is None or right is None:
-        if op == '=':
-            return left is None and right is None
-        if op == '<>':
-            return not (left is None and right is None)
         return False
 
     lt, lv = _ddb_comparable(left)
@@ -6900,6 +6910,43 @@ def _ddb_equals(a, b):
     ta, va = _ddb_comparable(a)
     tb, vb = _ddb_comparable(b)
     return ta == tb and va == vb
+
+
+def _ddb_items_equal(left: dict | None, right: dict | None) -> bool:
+    """Compare item images using DynamoDB value semantics."""
+    if left is None or right is None:
+        return left is right
+    if left.keys() != right.keys():
+        return False
+    for key in left:
+        a, b = left[key], right[key]
+        if a.keys() != b.keys():
+            return False
+        attr_type = next(iter(a), None)
+        if attr_type != next(iter(b), None):
+            return False
+        if attr_type == "N":
+            if not _ddb_equals(a, b):
+                return False
+        elif attr_type in ("SS", "NS", "BS"):
+            if attr_type == "NS":
+                if {Decimal(v) for v in a[attr_type]} != {Decimal(v) for v in b[attr_type]}:
+                    return False
+            else:
+                if set(a[attr_type]) != set(b[attr_type]):
+                    return False
+        elif attr_type == "M":
+            if not _ddb_items_equal(a[attr_type], b[attr_type]):
+                return False
+        elif attr_type == "L":
+            if len(a[attr_type]) != len(b[attr_type]):
+                return False
+            if any(not _ddb_items_equal({"value": x}, {"value": y})
+                   for x, y in zip(a[attr_type], b[attr_type])):
+                return False
+        elif a[attr_type] != b[attr_type]:
+            return False
+    return True
 
 
 def _ddb_type(val):
@@ -8093,7 +8140,7 @@ def _check_legacy_comparison(item_val, op, attr_vals):
     if op == "EQ":
         return item_val is not None and _ddb_equals(item_val, attr_vals[0])
     if op == "NE":
-        return item_val is None or not _ddb_equals(item_val, attr_vals[0])
+        return item_val is not None and not _ddb_equals(item_val, attr_vals[0])
     if op in ("LE", "LT", "GE", "GT"):
         sym = {"LE": "<=", "LT": "<", "GE": ">=", "GT": ">"}[op]
         return item_val is not None and _compare_ddb(item_val, sym, attr_vals[0])

@@ -275,12 +275,28 @@ def _sms_log_for(phone_number: str) -> list:
 
 def get_state():
     return {
-        "topics": copy.deepcopy(_topics),
+        "topics": _copy_topics_without_messages(),
         "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic),
         "sms_messages": copy.deepcopy(_sms_messages),
         "platform_applications": copy.deepcopy(_platform_applications),
         "platform_endpoints": copy.deepcopy(_platform_endpoints),
     }
+
+
+def _copy_topics_without_messages():
+    topics = AccountRegionScopedDict()
+    for scoped_key, topic in _topics.all_items():
+        account_id, region, arn = scoped_key
+        if isinstance(topic, dict):
+            topic = {
+                key: copy.deepcopy(value)
+                for key, value in topic.items()
+                if key != "messages"
+            }
+        else:
+            topic = copy.deepcopy(topic)
+        topics.set_scoped(account_id, region, arn, topic)
+    return topics
 
 
 def load_persisted_state(data):
@@ -290,6 +306,9 @@ def load_persisted_state(data):
 def _restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
+        for topic in _topics.all_values():
+            if isinstance(topic, dict):
+                topic.pop("messages", None)
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
         _sms_messages.update(data.get("sms_messages", {}))
         _platform_applications.update(data.get("platform_applications", {}))
@@ -421,7 +440,6 @@ def _create_topic(params):
                 }),
             },
             "subscriptions": [],
-            "messages": [],
             "tags": {},
         }
 
@@ -611,8 +629,43 @@ def _subscribe(params):
     if endpoint_error:
         return endpoint_error
 
+    requested_attrs = {}
+    allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
+                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
+    i = 1
+    while _p(params, f"Attributes.entry.{i}.key"):
+        key = _p(params, f"Attributes.entry.{i}.key")
+        val = _p(params, f"Attributes.entry.{i}.value")
+        if key in allowed_attrs:
+            if key == "FilterPolicy":
+                try:
+                    parsed_policy = json.loads(val or "")
+                except (TypeError, ValueError):
+                    return _error("InvalidParameterException", "Invalid FilterPolicy", 400)
+                if not isinstance(parsed_policy, dict):
+                    return _error("InvalidParameterException", "Invalid FilterPolicy", 400)
+            requested_attrs[key] = val or ""
+        i += 1
+
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
+            current = existing.get("attributes", {})
+            comparable = ("RawMessageDelivery", "FilterPolicy", "FilterPolicyScope")
+            for key in comparable:
+                requested = requested_attrs.get(key, "false" if key == "RawMessageDelivery"
+                                                else "MessageAttributes" if key == "FilterPolicyScope" else "")
+                actual = current.get(key, "false" if key == "RawMessageDelivery"
+                                      else "MessageAttributes" if key == "FilterPolicyScope" else "")
+                if key == "FilterPolicy" and requested and actual:
+                    try:
+                        if json.loads(requested) != json.loads(actual):
+                            return _error("InvalidParameterException",
+                                          "Subscription already exists with different attributes", 400)
+                    except (TypeError, ValueError):
+                        return _error("InvalidParameterException", "Invalid FilterPolicy", 400)
+                elif requested.lower() != actual.lower():
+                    return _error("InvalidParameterException",
+                                  "Subscription already exists with different attributes", 400)
             return _xml(200, "SubscribeResponse",
                         f"<SubscribeResult><SubscriptionArn>{existing['arn']}</SubscriptionArn></SubscribeResult>")
 
@@ -639,15 +692,7 @@ def _subscribe(params):
         },
     }
 
-    allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
-    i = 1
-    while _p(params, f"Attributes.entry.{i}.key"):
-        key = _p(params, f"Attributes.entry.{i}.key")
-        val = _p(params, f"Attributes.entry.{i}.value")
-        if key in allowed_attrs:
-            sub["attributes"][key] = val or ""
-        i += 1
+    sub["attributes"].update(requested_attrs)
 
     topic["subscriptions"].append(sub)
     _sub_arn_to_topic[sub_arn] = topic_arn
@@ -943,14 +988,6 @@ def publish_internal(
     else:
         msg_id = new_uuid()
 
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": message_structure,
-        "message_attributes": msg_attrs,
-        "timestamp": int(time.time()),
-    })
     _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
             message_group_id=message_group_id, message_dedup_id=dedup_id)
     logger.info(
@@ -1128,15 +1165,6 @@ def _publish_batch(params):
                     "sequence_number": seq_number,
                 }
 
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
-
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
                     message_group_id=group_id, message_dedup_id=dedup_id)
 
@@ -1150,14 +1178,6 @@ def _publish_batch(params):
         else:
             # ── Standard (non-FIFO) batch entry ──
             msg_id = new_uuid()
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
 
             successful += (
@@ -1293,28 +1313,8 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
 
     body = raw_message if raw else envelope
     sqs_attrs = dict(message_attributes) if raw and message_attributes else {}
-    now = time.time()
-    msg = {
-        "id": new_uuid(),
-        "body": body,
-        "md5": hashlib.md5(body.encode()).hexdigest(),
-        "message_attributes": sqs_attrs,
-        # Real SQS emits MD5OfMessageAttributes alongside MD5OfBody on
-        # ReceiveMessage; the field reads from msg["md5_attrs"]. Without
-        # this, raw SNS→SQS deliveries diverge from real AWS for
-        # consumers that verify the attribute MD5 (Java/Go SDKs do).
-        "md5_attrs": _sqs._md5_msg_attrs(sqs_attrs),
-        "receipt_handle": None,
-        "sent_at": now,
-        "visible_at": now,
-        "receive_count": 0,
-    }
-    if message_group_id:
-        msg["group_id"] = message_group_id
-    if message_dedup_id:
-        msg["dedup_id"] = message_dedup_id
-    _sqs._ensure_msg_fields(msg)
-    queue["messages"].append(msg)
+    _sqs.enqueue_internal(queue, body, sqs_attrs, message_group_id or None,
+                          message_dedup_id or None)
     logger.info("SNS fanout → SQS %s", queue_name)
 
 

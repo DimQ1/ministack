@@ -869,6 +869,62 @@ def test_sqs_change_message_visibility_invalid_receipt_handle(sqs):
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
+def test_sqs_message_indexes_rebuild_from_legacy_state(monkeypatch):
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import sqs as sqs_service
+
+    queue_url = "http://localhost:4566/000000000000/legacy-index-test"
+    message = {
+        "id": "legacy-message-id",
+        "receipt_handle": "legacy-receipt-handle",
+        "visible_at": 0,
+    }
+    legacy_queue = {
+        "name": "legacy-index-test",
+        "url": queue_url,
+        "is_fifo": False,
+        "attributes": {},
+        "messages": [message],
+    }
+    monkeypatch.setattr(sqs_service, "_queues", AccountRegionScopedDict())
+    monkeypatch.setattr(
+        sqs_service, "_queue_name_to_url", AccountRegionScopedDict(),
+    )
+    sqs_service.load_persisted_state({"queues": {queue_url: legacy_queue}})
+    queue = sqs_service._queues[queue_url]
+
+    assert queue["_by_id"]["legacy-message-id"]["id"] == "legacy-message-id"
+    assert queue["_by_rh"]["legacy-receipt-handle"]["id"] == "legacy-message-id"
+
+    class NoIterationList(list):
+        def __iter__(self):
+            raise AssertionError("receipt-handle lookup iterated the message list")
+
+    queue["messages"] = NoIterationList(queue["messages"])
+    message = queue["messages"][0]
+    sqs_service._set_receipt_handle(queue, message, "rotated-receipt-handle")
+    assert "legacy-receipt-handle" not in queue["_by_rh"]
+    assert queue["_by_rh"]["rotated-receipt-handle"] is message
+    monkeypatch.setattr(sqs_service, "_get_q", lambda *_args: queue)
+    sqs_service._act_change_visibility(
+        {"ReceiptHandle": "rotated-receipt-handle", "VisibilityTimeout": 10},
+        queue_url,
+    )
+    assert queue["messages"][0]["visible_at"] > 0
+
+    sqs_service._act_delete_message(
+        {"ReceiptHandle": "rotated-receipt-handle"}, queue_url,
+    )
+    assert len(queue["messages"]) == 0
+    assert queue["_by_id"] == {}
+    assert queue["_by_rh"] == {}
+    queue["messages"] = queue["messages"][:]
+    state = sqs_service.get_state()
+    saved_queue = state["queues"].get(queue_url)
+    assert "_by_id" not in saved_queue
+    assert "_by_rh" not in saved_queue
+
+
 def test_sqs_receive_max_10(sqs):
     """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
     url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]

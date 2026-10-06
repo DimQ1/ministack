@@ -57,6 +57,119 @@ _queue_name_to_url = AccountRegionScopedDict()
 _queues_lock = threading.Lock()
 
 
+def _queue_condition(q: dict) -> asyncio.Condition:
+    """Return the non-persisted wake-up condition for a queue."""
+    condition = q.get("_condition")
+    if condition is None:
+        condition = asyncio.Condition()
+        q["_condition"] = condition
+    return condition
+
+
+def _wake_queue(q: dict) -> None:
+    """Wake long-poll receivers after a synchronous queue mutation."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def notify() -> None:
+        condition = _queue_condition(q)
+        async with condition:
+            condition.notify_all()
+
+    loop.create_task(notify())
+
+
+def _next_queue_deadline(q: dict, deadline: float) -> float:
+    now = time.time()
+    next_visible = min(
+        (m.get("visible_at", now) for m in q["messages"]
+         if m.get("visible_at", now) > now),
+        default=deadline,
+    )
+    return min(deadline, next_visible)
+
+
+_NON_PERSISTED_QUEUE_KEYS = {
+    "_condition", "_by_id", "_by_rh", "_message_index_size",
+}
+
+
+def _rebuild_message_indexes(q: dict) -> None:
+    by_id: dict = {}
+    by_rh: dict = {}
+    messages = q.get("messages", [])
+    for message in messages:
+        message_id = message.get("id")
+        if message_id is not None:
+            by_id.setdefault(message_id, message)
+        receipt_handle = message.get("receipt_handle")
+        if receipt_handle is not None:
+            by_rh.setdefault(receipt_handle, message)
+    q["_by_id"] = by_id
+    q["_by_rh"] = by_rh
+    q["_message_index_size"] = len(messages)
+
+
+def _ensure_message_indexes(q: dict) -> tuple[dict, dict]:
+    if (
+        not isinstance(q.get("_by_id"), dict)
+        or not isinstance(q.get("_by_rh"), dict)
+        or q.get("_message_index_size") != len(q.get("messages", []))
+    ):
+        _rebuild_message_indexes(q)
+    return q["_by_id"], q["_by_rh"]
+
+
+def _index_message(q: dict, message: dict) -> None:
+    by_id = q.setdefault("_by_id", {})
+    by_rh = q.setdefault("_by_rh", {})
+    message_id = message.get("id")
+    if message_id is not None:
+        by_id.setdefault(message_id, message)
+    receipt_handle = message.get("receipt_handle")
+    if receipt_handle is not None:
+        by_rh.setdefault(receipt_handle, message)
+    q["_message_index_size"] = len(q.get("messages", []))
+
+
+def _append_message(q: dict, message: dict) -> None:
+    _ensure_message_indexes(q)
+    q["messages"].append(message)
+    _index_message(q, message)
+
+
+def _set_receipt_handle(q: dict, message: dict, receipt_handle: str) -> None:
+    by_id, by_rh = _ensure_message_indexes(q)
+    previous = message.get("receipt_handle")
+    if previous is not None and by_rh.get(previous) is message:
+        by_rh.pop(previous, None)
+    message["receipt_handle"] = receipt_handle
+    message_id = message.get("id")
+    if message_id is not None:
+        by_id.setdefault(message_id, message)
+    by_rh[receipt_handle] = message
+
+
+def _remove_message(q: dict, message: dict) -> bool:
+    by_id, by_rh = _ensure_message_indexes(q)
+    try:
+        q["messages"].remove(message)
+    except ValueError:
+        _rebuild_message_indexes(q)
+        return False
+
+    message_id = message.get("id")
+    if message_id is not None and by_id.get(message_id) is message:
+        by_id.pop(message_id, None)
+    receipt_handle = message.get("receipt_handle")
+    if receipt_handle is not None and by_rh.get(receipt_handle) is message:
+        by_rh.pop(receipt_handle, None)
+    q["_message_index_size"] = len(q["messages"])
+    return True
+
+
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
@@ -64,8 +177,15 @@ def get_state():
     # request's account/region via AccountRegionScopedDict.__iter__, so other
     # tenants' name→url mappings would silently disappear at shutdown
     # serialisation. Same bug family as #492.
+    queues = AccountRegionScopedDict()
+    for scoped_key, queue in _queues.all_items():
+        persisted_queue = {
+            key: value for key, value in queue.items()
+            if key not in _NON_PERSISTED_QUEUE_KEYS
+        }
+        queues._data[scoped_key] = copy.deepcopy(persisted_queue)
     return {
-        "queues": copy.deepcopy(_queues),
+        "queues": queues,
         "queue_name_to_url": copy.deepcopy(_queue_name_to_url),
     }
 
@@ -77,6 +197,10 @@ def load_persisted_state(data):
 def _restore_state(data):
     if data:
         _queues.update(data.get("queues", {}))
+        for queue in _queues.all_values():
+            if isinstance(queue, dict):
+                queue.pop("_condition", None)
+                _rebuild_message_indexes(queue)
         _queue_name_to_url.clear()
         _rebuild_queue_name_index()
 
@@ -533,6 +657,9 @@ def _act_create_queue(data: dict, _u: str) -> dict:
             "ReceiveMessageWaitTimeSeconds": "0",
         },
         "messages": [],
+        "_by_id": {},
+        "_by_rh": {},
+        "_message_index_size": 0,
         "tags": {},
         "dedup_cache": {},
         "fifo_seq": 0,
@@ -710,7 +837,8 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         "dedup_cache_key": dedup_cache_key if q["is_fifo"] else None,
         "seq": seq,
     }
-    q["messages"].append(msg)
+    _append_message(q, msg)
+    _wake_queue(q)
 
     if q["is_fifo"] and dedup_id:
         q["dedup_cache"][dedup_cache_key] = {
@@ -732,7 +860,10 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:ReceiveMessage")
 
-    max_n = min(int(data.get("MaxNumberOfMessages", 1)), 10)
+    max_n = int(data.get("MaxNumberOfMessages", 1))
+    if max_n < 1 or max_n > 10:
+        raise _Err("InvalidParameterValue",
+                   "MaxNumberOfMessages must be between 1 and 10.")
     # An explicit request value wins even when it is 0 — a supplied
     # VisibilityTimeout=0 / WaitTimeSeconds=0 must NOT fall back to the queue
     # attribute (0 is falsy in Python; keying on presence is required).
@@ -740,6 +871,9 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     vis = int(_vis if _vis is not None else q["attributes"].get("VisibilityTimeout", "30"))
     _wait = data.get("WaitTimeSeconds")
     wait = int(_wait if _wait is not None else q["attributes"].get("ReceiveMessageWaitTimeSeconds", "0"))
+    if wait < 0 or wait > 20:
+        raise _Err("InvalidParameterValue",
+                   "WaitTimeSeconds must be between 0 and 20 seconds.")
 
     attr_names = (data.get("AttributeNames")
                   or data.get("MessageSystemAttributeNames") or [])
@@ -753,7 +887,13 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
         msgs = _collect_msgs(q, max_n, vis)
         if msgs or time.time() >= deadline:
             break
-        await asyncio.sleep(min(0.1, max(0.01, deadline - time.time())))
+        condition = _queue_condition(q)
+        timeout = max(0.01, _next_queue_deadline(q, deadline) - time.time())
+        async with condition:
+            try:
+                await asyncio.wait_for(condition.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
 
     out: list = []
     for m in msgs:
@@ -785,26 +925,18 @@ def _act_delete_message(data: dict, qurl: str) -> dict:
     if not rh:
         raise _Err("MissingParameter",
                     "The request must contain the parameter ReceiptHandle.")
-    # Only remove messages whose receipt_handle is set and matches.
-    # Messages that have never been received (receipt_handle is None) are never
-    # accidentally removed by an empty or unrelated receipt handle.
-    found = False
-    kept = []
-    for m in q["messages"]:
-        if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
-            found = True
-            # Do NOT clear the FIFO dedup entry here. Real SQS keeps a strict
-            # 5-minute dedup window measured from send time, independent of
-            # whether the message was ever received or deleted; clearing on
-            # delete let a duplicate through as soon as the original was
-            # consumed (e.g. by a Lambda ESM), which is #1326. The window is
-            # enforced by the entry's `expire` and _prune_dedup. Reset the
-            # queue (/_ministack/reset) to reuse a dedup id immediately in tests.
-        else:
-            kept.append(m)
-    if not found:
+    # Do NOT clear the FIFO dedup entry here. Real SQS keeps a strict 5-minute
+    # window measured from send time, independent of whether the message was
+    # received or deleted; see #1326.
+    _, by_rh = _ensure_message_indexes(q)
+    message = by_rh.get(rh)
+    if (
+        message is None
+        or message.get("receipt_handle") != rh
+        or not _remove_message(q, message)
+    ):
         raise _Err("ReceiptHandleIsInvalid", "The input receipt handle is invalid.")
-    q["messages"] = kept
+    _wake_queue(q)
     return {}
 
 
@@ -815,14 +947,12 @@ def _act_change_visibility(data: dict, qurl: str) -> dict:
     q = _get_q(url, "sqs:ChangeMessageVisibility")
     rh = data.get("ReceiptHandle", "")
     vt = int(data.get("VisibilityTimeout", 30))
-    found = False
-    for m in q["messages"]:
-        if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
-            m["visible_at"] = time.time() + vt
-            found = True
-            break
-    if not found:
+    _, by_rh = _ensure_message_indexes(q)
+    message = by_rh.get(rh)
+    if message is None or message.get("receipt_handle") != rh:
         raise _Err("ReceiptHandleIsInvalid", "The input receipt handle is invalid.")
+    message["visible_at"] = time.time() + vt
+    _wake_queue(q)
     return {}
 
 
@@ -878,13 +1008,10 @@ def _act_change_visibility_batch(data: dict, qurl: str) -> dict:
         eid = e.get("Id", "")
         rh = e.get("ReceiptHandle", "")
         vt = int(e.get("VisibilityTimeout", 30))
-        found = False
-        for m in q["messages"]:
-            if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
-                m["visible_at"] = time.time() + vt
-                found = True
-                break
-        if found:
+        _, by_rh = _ensure_message_indexes(q)
+        message = by_rh.get(rh)
+        if message is not None and message.get("receipt_handle") == rh:
+            message["visible_at"] = time.time() + vt
             ok.append({"Id": eid})
         else:
             fail.append({
@@ -1028,6 +1155,10 @@ def _act_purge_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:PurgeQueue")
     q["messages"].clear()
+    by_id, by_rh = _ensure_message_indexes(q)
+    by_id.clear()
+    by_rh.clear()
+    q["_message_index_size"] = 0
     return {}
 
 
@@ -1089,17 +1220,14 @@ def _act_delete_message_batch(data: dict, qurl: str) -> dict:
     for e in entries:
         eid = e.get("Id", "")
         rh = e.get("ReceiptHandle", "")
-        before = len(q["messages"])
-        kept = []
-        for m in q["messages"]:
-            if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
-                # Matched → dropped. The FIFO dedup entry is intentionally kept
-                # for its full 5-minute window (see DeleteMessage / #1326).
-                pass
-            else:
-                kept.append(m)
-        q["messages"] = kept
-        if len(q["messages"]) < before:
+        _, by_rh = _ensure_message_indexes(q)
+        message = by_rh.get(rh)
+        if (
+            message is not None
+            and message.get("receipt_handle") == rh
+            and _remove_message(q, message)
+        ):
+            # Keep FIFO dedup entries for their full five-minute window.
             ok.append({"Id": eid})
         else:
             fail.append({
@@ -1233,6 +1361,44 @@ def _ensure_msg_fields(m: dict) -> None:
     m.setdefault("seq", None)
 
 
+def enqueue_internal(q: dict, body: str, message_attributes: dict | None = None,
+                     group_id: str | None = None,
+                     dedup_id: str | None = None) -> dict:
+    """Enqueue an internally delivered message using queue semantics."""
+    body = body if isinstance(body, str) else str(body)
+    max_size = int(q["attributes"].get("MaximumMessageSize", "1048576"))
+    if len(body.encode("utf-8")) > max_size:
+        raise _Err("InvalidParameterValue", "Message exceeds MaximumMessageSize.")
+
+    now = time.time()
+    seq = None
+    if q["is_fifo"]:
+        if not group_id:
+            raise _Err("MissingParameter", "MessageGroupId is required.")
+        q["fifo_seq"] += 1
+        seq = str(q["fifo_seq"]).zfill(20)
+    attrs = message_attributes or {}
+    msg = {
+        "id": new_uuid(),
+        "body": body,
+        "md5_body": hashlib.md5(body.encode()).hexdigest(),
+        "md5_attrs": _md5_msg_attrs(attrs),
+        "receipt_handle": None,
+        "sent_at": now,
+        "visible_at": now + int(q["attributes"].get("DelaySeconds", "0")),
+        "receive_count": 0,
+        "first_receive_at": None,
+        "message_attributes": attrs,
+        "sys": _build_send_sys_attrs(now, {}),
+        "group_id": group_id,
+        "dedup_id": dedup_id,
+        "seq": seq,
+    }
+    _append_message(q, msg)
+    _wake_queue(q)
+    return msg
+
+
 def _refresh_counts(q: dict) -> None:
     """Recompute approximate message counters."""
     now = time.time()
@@ -1253,14 +1419,16 @@ def _refresh_counts(q: dict) -> None:
 
 def _collect_msgs(q: dict, max_n: int, vis_timeout: int) -> list:
     now = time.time()
+    _ensure_message_indexes(q)
     if q["is_fifo"]:
         return _collect_fifo(q, max_n, vis_timeout, now)
     for m in q["messages"]:
         _ensure_msg_fields(m)
+        _index_message(q, m)
     visible = [m for m in q["messages"] if m["visible_at"] <= now]
     result = visible[:max_n]
     for m in result:
-        m["receipt_handle"] = new_uuid()
+        _set_receipt_handle(q, m, new_uuid())
         m["visible_at"] = now + vis_timeout
         m["receive_count"] += 1
         if m.get("first_receive_at") is None:
@@ -1277,6 +1445,7 @@ def _collect_fifo(q: dict, max_n: int, vis_timeout: int,
     """
     for m in q["messages"]:
         _ensure_msg_fields(m)
+        _index_message(q, m)
     inflight_groups: set = {
         m["group_id"] for m in q["messages"]
         if m["visible_at"] > now
@@ -1292,7 +1461,7 @@ def _collect_fifo(q: dict, max_n: int, vis_timeout: int,
         g = m["group_id"]
         if g in inflight_groups:
             continue
-        m["receipt_handle"] = new_uuid()
+        _set_receipt_handle(q, m, new_uuid())
         m["visible_at"] = now + vis_timeout
         m["receive_count"] += 1
         if m.get("first_receive_at") is None:
@@ -1333,15 +1502,21 @@ def _dlq_sweep(q: dict) -> None:
 
     now = time.time()
     keep: list = []
+    moved_any = False
     for m in q["messages"]:
         if m["receive_count"] >= max_rc and m["visible_at"] <= now:
             moved = dict(m)
             moved["receipt_handle"] = None
             moved["visible_at"] = now
-            dlq["messages"].append(moved)
+            _append_message(dlq, moved)
+            moved_any = True
         else:
             keep.append(m)
     q["messages"] = keep
+    if moved_any:
+        _rebuild_message_indexes(q)
+        _wake_queue(q)
+        _wake_queue(dlq)
 
 
 # ── FIFO deduplication cache maintenance ───────────────────
@@ -1951,14 +2126,9 @@ def _delete_messages_for_esm(queue_url: str, receipt_handles: set[str]) -> None:
         return
     with _queues_lock:
         q = _get_q(queue_url)
-        kept = []
-        for m in q["messages"]:
-            if m.get("receipt_handle") is not None and m.get("receipt_handle") in receipt_handles:
-                # Matched → dropped. Keep the FIFO dedup entry for its full
-                # 5-minute window: this is the Lambda ESM delete path, and
-                # clearing it here was the primary cause of #1326 (a duplicate
-                # sent seconds after ESM consumption was delivered again).
-                pass
-            else:
-                kept.append(m)
-        q["messages"] = kept
+        _, by_rh = _ensure_message_indexes(q)
+        for receipt_handle in receipt_handles:
+            message = by_rh.get(receipt_handle)
+            if message is not None:
+                # Keep FIFO dedup entries for the full five-minute window.
+                _remove_message(q, message)
