@@ -876,6 +876,15 @@ def test_dynamodb_list_tables(ddb):
         resp2 = ddb.list_tables(ExclusiveStartTableName=resp["LastEvaluatedTableName"], Limit=100)
         assert len(resp2["TableNames"]) >= 1
 
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_dynamodb_list_tables_rejects_invalid_limit(limit):
+    from ministack.services import dynamodb as ddb_service
+
+    status, _headers, body = ddb_service._list_tables({"Limit": limit})
+    assert status == 400
+    assert json.loads(body)["__type"].endswith("ValidationException")
+
 def test_dynamodb_put_get_item(ddb):
     ddb.put_item(
         TableName="t_hash_only",
@@ -1490,6 +1499,303 @@ def test_dynamodb_gsi_query(ddb):
     for item in resp["Items"]:
         assert item["gsi_pk"]["S"] == "shared_gsi"
 
+
+def test_dynamodb_lsi_fetches_unprojected_attributes_but_gsi_does_not(ddb):
+    table = f"qa-ddb-index-projection-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            {"AttributeName": "lsi_sk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        LocalSecondaryIndexes=[{
+            "IndexName": "lsi",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "lsi_sk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(
+        TableName=table,
+        Item={
+            "pk": {"S": "partition"},
+            "sk": {"S": "base-sort"},
+            "gsi_pk": {"S": "global"},
+            "lsi_sk": {"S": "local-sort"},
+            "base_only": {"S": "fetched-from-table"},
+        },
+    )
+
+    lsi_query = ddb.query(
+        TableName=table,
+        IndexName="lsi",
+        KeyConditionExpression="pk = :pk",
+        ExpressionAttributeValues={":pk": {"S": "partition"}},
+    )
+    gsi_query = ddb.query(
+        TableName=table,
+        IndexName="gsi",
+        KeyConditionExpression="gsi_pk = :gsi",
+        ExpressionAttributeValues={":gsi": {"S": "global"}},
+    )
+    lsi_scan = ddb.scan(TableName=table, IndexName="lsi")
+
+    assert lsi_query["Items"][0]["base_only"] == {"S": "fetched-from-table"}
+    assert lsi_scan["Items"][0]["base_only"] == {"S": "fetched-from-table"}
+    assert "base_only" not in gsi_query["Items"][0]
+
+    lsi_projection = ddb.query(
+        TableName=table,
+        IndexName="lsi",
+        KeyConditionExpression="pk = :pk",
+        ProjectionExpression="base_only",
+        ExpressionAttributeValues={":pk": {"S": "partition"}},
+    )
+    assert lsi_projection["Items"] == [{"base_only": {"S": "fetched-from-table"}}]
+
+    for kwargs in (
+        {"ProjectionExpression": "base_only"},
+        {
+            "FilterExpression": "base_only = :base",
+        },
+    ):
+        expression_values = {":gsi": {"S": "global"}}
+        if "FilterExpression" in kwargs:
+            expression_values[":base"] = {"S": "fetched-from-table"}
+        with pytest.raises(ClientError) as exc:
+            ddb.query(
+                TableName=table,
+                IndexName="gsi",
+                KeyConditionExpression="gsi_pk = :gsi",
+                ExpressionAttributeValues=expression_values,
+                **kwargs,
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_dynamodb_update_table_adds_a_backfilled_gsi_with_index_metadata(ddb):
+    table = f"qa-ddb-gsi-add-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for index in range(2):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": f"row-{index}"},
+                "gsi_pk": {"S": "shared"},
+                "payload": {"S": "before-index"},
+            },
+        )
+
+    description = ddb.update_table(
+        TableName=table,
+        AttributeDefinitions=[{"AttributeName": "gsi_pk", "AttributeType": "S"}],
+        GlobalSecondaryIndexUpdates=[{"Create": {
+            "IndexName": "gsi",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }}],
+    )["TableDescription"]
+    gsi = description["GlobalSecondaryIndexes"][0]
+    assert gsi["IndexStatus"] == "ACTIVE"
+    assert gsi["ItemCount"] == 2
+    assert gsi["IndexSizeBytes"] > 0
+
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "row-0"}},
+        UpdateExpression="SET payload = :payload",
+        ExpressionAttributeValues={":payload": {"S": "not-projected"}},
+    )
+    unchanged = ddb.describe_table(TableName=table)["Table"]["GlobalSecondaryIndexes"][0]
+    assert unchanged["ItemCount"] == 2
+    assert unchanged["IndexSizeBytes"] == gsi["IndexSizeBytes"]
+
+    result = ddb.query(
+        TableName=table,
+        IndexName="gsi",
+        KeyConditionExpression="gsi_pk = :gsi",
+        ExpressionAttributeValues={":gsi": {"S": "shared"}},
+    )
+    assert result["Count"] == 2
+
+
+def test_dynamodb_update_table_rejects_multiple_gsi_updates(ddb):
+    table = f"qa-ddb-gsi-multiple-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    with pytest.raises(ClientError) as exc:
+        ddb.update_table(
+            TableName=table,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+                {"AttributeName": "other_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[
+                {"Create": {
+                    "IndexName": "gsi-one",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }},
+                {"Create": {
+                    "IndexName": "gsi-two",
+                    "KeySchema": [{"AttributeName": "other_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }},
+            ],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+def test_dynamodb_gsi_membership_tracks_item_mutations(ddb):
+    table = f"qa-ddb-gsi-maintenance-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi_index",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    def index_count(value):
+        return ddb.query(
+            TableName=table,
+            IndexName="gsi_index",
+            KeyConditionExpression="gsi_pk = :value",
+            ExpressionAttributeValues={":value": {"S": value}},
+        )["Count"]
+
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "row-1"}, "gsi_pk": {"S": "first"}},
+    )
+    ddb.put_item(
+        TableName=table,
+        Item={"pk": {"S": "row-1"}, "gsi_pk": {"S": "second"}},
+    )
+    assert index_count("first") == 0
+    assert index_count("second") == 1
+
+    ddb.update_item(
+        TableName=table,
+        Key={"pk": {"S": "row-1"}},
+        UpdateExpression="SET gsi_pk = :next",
+        ExpressionAttributeValues={":next": {"S": "third"}},
+    )
+    assert index_count("second") == 0
+    assert index_count("third") == 1
+
+    ddb.batch_write_item(RequestItems={table: [{
+        "PutRequest": {"Item": {"pk": {"S": "row-2"}, "gsi_pk": {"S": "batch"}}},
+    }]})
+    assert index_count("batch") == 1
+    assert ddb.describe_table(TableName=table)["Table"]["ItemCount"] == 2
+
+    ddb.transact_write_items(TransactItems=[{
+        "Update": {
+            "TableName": table,
+            "Key": {"pk": {"S": "row-1"}},
+            "UpdateExpression": "SET gsi_pk = :next",
+            "ExpressionAttributeValues": {":next": {"S": "transaction"}},
+        },
+    }])
+    assert index_count("third") == 0
+    assert index_count("transaction") == 1
+    assert ddb.describe_table(TableName=table)["Table"]["ItemCount"] == 2
+
+    ddb.batch_write_item(RequestItems={table: [{
+        "DeleteRequest": {"Key": {"pk": {"S": "row-2"}}},
+    }]})
+    ddb.delete_item(TableName=table, Key={"pk": {"S": "row-1"}})
+    assert index_count("batch") == 0
+    assert index_count("transaction") == 0
+    assert ddb.describe_table(TableName=table)["Table"]["ItemCount"] == 0
+
+def test_dynamodb_keys_only_gsi_query_ranges_and_paginates_by_index_size(ddb):
+    table = f"qa-ddb-gsi-byte-page-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_sk", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi_index",
+            "KeySchema": [
+                {"AttributeName": "gsi_pk", "KeyType": "HASH"},
+                {"AttributeName": "gsi_sk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for index in range(8):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": f"row-{index}"},
+                "gsi_pk": {"S": "shared"},
+                "gsi_sk": {"S": f"{index:02d}"},
+                "payload": {"S": "x" * 150_000},
+            },
+        )
+
+    query = {
+        "TableName": table,
+        "IndexName": "gsi_index",
+        "KeyConditionExpression": "gsi_pk = :pk AND gsi_sk BETWEEN :lo AND :hi",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "shared"},
+            ":lo": {"S": "00"},
+            ":hi": {"S": "07"},
+        },
+    }
+    full_page = ddb.query(**query)
+    assert full_page["Count"] == 8
+    assert "LastEvaluatedKey" not in full_page
+    assert all("payload" not in item for item in full_page["Items"])
+
+    page = ddb.query(**query, Limit=3)
+    paged_sort_keys = []
+    while True:
+        paged_sort_keys.extend(item["gsi_sk"]["S"] for item in page["Items"])
+        last_key = page.get("LastEvaluatedKey")
+        if last_key is None:
+            break
+        page = ddb.query(**query, Limit=3, ExclusiveStartKey=last_key)
+    assert paged_sort_keys == [f"{index:02d}" for index in range(8)]
+
 def test_dynamodb_ttl(ddb):
     import uuid as _uuid
 
@@ -1970,6 +2276,76 @@ def test_dynamodb_scan_with_limit_and_pagination(ddb):
         if not lek:
             break
     assert len(all_items) == 10
+
+
+def test_dynamodb_scan_keeps_lexical_order_across_key_index_updates(ddb):
+    table = f"qa-ddb-scan-order-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for key in ("2", "1", "10"):
+        ddb.put_item(TableName=table, Item={"pk": {"S": key}})
+
+    def collect_pages():
+        keys = []
+        last_key = None
+        while True:
+            request = {"TableName": table, "Limit": 1}
+            if last_key:
+                request["ExclusiveStartKey"] = last_key
+            page = ddb.scan(**request)
+            keys.extend(item["pk"]["S"] for item in page["Items"])
+            last_key = page.get("LastEvaluatedKey")
+            if not last_key:
+                return keys
+
+    assert collect_pages() == ["1", "10", "2"]
+    ddb.delete_item(TableName=table, Key={"pk": {"S": "10"}})
+    ddb.put_item(TableName=table, Item={"pk": {"S": "11"}})
+    assert collect_pages() == ["1", "11", "2"]
+
+def test_dynamodb_query_and_scan_paginate_at_one_megabyte(ddb):
+    table = f"qa-ddb-byte-page-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for index in range(3):
+        ddb.put_item(
+            TableName=table,
+            Item={
+                "pk": {"S": "shared"},
+                "sk": {"S": f"item-{index}"},
+                "payload": {"S": "x" * 400_000},
+            },
+        )
+
+    query = {
+        "TableName": table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "shared"}},
+    }
+    for operation, request in ((ddb.query, query), (ddb.scan, {"TableName": table})):
+        first_page = operation(**request)
+        assert 0 < first_page["Count"] < 3
+        assert "LastEvaluatedKey" in first_page
+
+        second_page = operation(
+            **request, ExclusiveStartKey=first_page["LastEvaluatedKey"]
+        )
+        assert first_page["Count"] + second_page["Count"] == 3
+        assert "LastEvaluatedKey" not in second_page
 
 def test_dynamodb_transact_write_condition_cancel(ddb):
     """TransactWriteItems cancels entire transaction if one condition fails."""
@@ -3196,6 +3572,8 @@ def test_dynamodb_query_key_conditions_sort_key_begins_with(ddb):
     )
     # sk_000, sk_001, sk_002, sk_003, sk_004 all start with "sk_00"
     assert resp["Count"] == 5
+    sks = [item["sk"]["S"] for item in resp["Items"]]
+    assert sks == ["sk_000", "sk_001", "sk_002", "sk_003", "sk_004"]
 
 
 def test_dynamodb_query_key_conditions_sort_key_between(ddb):
@@ -3236,8 +3614,48 @@ def test_dynamodb_query_key_conditions_sort_key_lt(ddb):
         },
     )
     assert resp["Count"] == 2
-    sks = [item["sk"]["S"] for item in resp["Items"]]
-    assert sks == ["sk_000", "sk_001"]
+
+
+def test_dynamodb_legacy_scan_and_query_filters_honor_conditional_operator(ddb):
+    table = f"legacy-filter-or-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for sort_key, left, right in (
+        ("1", "yes", "no"),
+        ("2", "no", "yes"),
+        ("3", "no", "no"),
+    ):
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "partition"},
+            "sk": {"S": sort_key},
+            "left": {"S": left},
+            "right": {"S": right},
+        })
+    filters = {
+        "left": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "yes"}]},
+        "right": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "yes"}]},
+    }
+
+    scan = ddb.scan(TableName=table, ScanFilter=filters, ConditionalOperator="OR")
+    query = ddb.query(
+        TableName=table,
+        KeyConditions={"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "partition"}]}},
+        QueryFilter=filters,
+        ConditionalOperator="OR",
+    )
+
+    assert scan["Count"] == 2
+    assert query["Count"] == 2
 
 
 def test_dynamodb_query_key_conditions_mutually_exclusive(ddb):
@@ -5304,6 +5722,61 @@ def test_dynamodb_transact_write_idempotency_token_same_payload(ddb):
         ddb.transact_write_items(ClientRequestToken=token, TransactItems=items)
     finally:
         ddb.delete_table(TableName=name)
+
+
+@pytest.mark.parametrize(
+    "attribute_update",
+    [
+        {"Action": "PUT", "Value": {"S": "same-key"}},
+        {"Action": "DELETE"},
+    ],
+)
+def test_dynamodb_legacy_attribute_updates_reject_key_attributes(ddb, attribute_update):
+    table = f"legacy-key-update-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName=table, Item={"pk": {"S": "same-key"}, "value": {"S": "kept"}})
+
+    with pytest.raises(ClientError) as exc:
+        ddb.update_item(TableName=table, Key={"pk": {"S": "same-key"}}, AttributeUpdates={"pk": attribute_update})
+
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert ddb.get_item(TableName=table, Key={"pk": {"S": "same-key"}})["Item"]["value"]["S"] == "kept"
+
+
+def test_dynamodb_transaction_idempotency_cache_uses_bounded_digests(monkeypatch):
+    from ministack.core.responses import request_scope
+    from ministack.services import dynamodb as ddb_service
+
+    store = ddb_service._txn_idempotency
+    saved = dict(store._data)
+    try:
+        store.clear()
+        monkeypatch.setattr(ddb_service, "_TXN_IDEMPOTENCY_MAX_ENTRIES", 2)
+        with request_scope("000000000000", "us-east-1"):
+            now = time.time()
+            for token, created_at in (("oldest", now - 3), ("middle", now - 2), ("newest", now - 1)):
+                store[token] = {
+                    "created_at": created_at,
+                    "signature_digest": ddb_service._transaction_signature_digest({
+                        "TransactItems": [{"Put": {"Item": {"pk": {"S": token}}}}],
+                    }),
+                    "response": {},
+                    "sizes": {},
+                }
+
+            ddb_service._prune_txn_idempotency()
+
+            assert set(store) == {"middle", "newest"}
+            assert all("signature" not in entry and len(entry["signature_digest"]) == 64
+                       for entry in store.values())
+    finally:
+        store._data.clear()
+        store._data.update(saved)
 
 
 # ---------------------------------------------------------------------------

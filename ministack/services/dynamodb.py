@@ -18,13 +18,16 @@ Uses X-Amz-Target header for action routing (JSON API).
 
 import base64
 import binascii
+import bisect
 import copy
 import csv
 import gzip
+import hashlib
 import io
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -116,8 +119,15 @@ _lock = threading.Lock()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
+    tables = AccountRegionScopedDict()
+    for (account_id, region, table_name), table in _tables.all_items():
+        table_state = {
+            key: value for key, value in table.items()
+            if key not in {"_secondary_indexes", "_scan_keys"}
+        }
+        tables.set_scoped(account_id, region, table_name, copy.deepcopy(table_state))
     return {
-        "tables": copy.deepcopy(_tables),
+        "tables": tables,
         "tags": copy.deepcopy(_tags),
         "ttl_settings": copy.deepcopy(_ttl_settings),
         "pitr_settings": copy.deepcopy(_pitr_settings),
@@ -214,6 +224,10 @@ def _restore_state(data):
             sse = tbl.get("SSEDescription")
             if sse and "Status" not in sse and ("Enabled" in sse or "KMSMasterKeyId" in sse):
                 tbl["SSEDescription"] = _sse_description_from_spec(sse)
+            tbl.pop("_secondary_indexes", None)
+            tbl.pop("_scan_keys", None)
+            _update_counts(tbl)
+            _rebuild_secondary_indexes(tbl)
         _tags.update(data.get("tags", {}))
         _restore_table_name_metadata(_ttl_settings, data.get("ttl_settings", {}))
         _restore_table_name_metadata(_pitr_settings, data.get("pitr_settings", {}))
@@ -560,6 +574,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
 _stream_records = AccountRegionScopedDict()
+_closed_streams = AccountRegionScopedDict()
 
 
 def _stream_label() -> str:
@@ -576,7 +591,19 @@ _stream_seq_lock = threading.Lock()
 
 # AWS DynamoDB Streams keeps records for 24 hours; retention is purely
 # time-based, so records are expired by age and by nothing else.
-_STREAM_RETENTION_SECONDS = 24 * 60 * 60
+def _stream_env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+_STREAM_RETENTION_SECONDS = _stream_env_int(
+    "MINISTACK_DDB_STREAM_RETENTION_SECONDS", 24 * 60 * 60, 1
+)
+_STREAM_MAX_RECORDS = _stream_env_int("MINISTACK_DDB_STREAM_MAX_RECORDS", 0, 0)
+_CLOSED_STREAM_RETENTION_SECONDS = 24 * 60 * 60
 
 
 def _record_age_cutoff(record: dict, cutoff: float) -> bool:
@@ -604,6 +631,8 @@ def _trim_stream_records(table_name: str, *, account_id=None, region=None) -> No
     expired = 0
     while expired < len(records) and _record_age_cutoff(records[expired], cutoff):
         expired += 1
+    if _STREAM_MAX_RECORDS:
+        expired = max(expired, len(records) - _STREAM_MAX_RECORDS)
     if not expired:
         return
     del records[:expired]
@@ -662,9 +691,53 @@ def stream_live_records(table_name: str, *, account_id=None, region=None) -> lis
     return _live_stream_records(table_name, account_id, region)
 
 
-def drop_stream_records(table_name: str) -> None:
-    _stream_records.pop(table_name, None)
-    _stream_trimmed.pop(table_name, None)
+def closed_stream_info(stream_arn: str, *, account_id: str, region: str) -> dict | None:
+    closed = _closed_streams.get_scoped(account_id, region, stream_arn)
+    if not closed:
+        return None
+    if closed.get("expires_at", 0) <= time.time():
+        _closed_streams.pop_scoped(account_id, region, stream_arn, None)
+        return None
+    records = closed["records"]
+    cutoff = time.time() - _STREAM_RETENTION_SECONDS
+    expired = 0
+    while expired < len(records) and _record_age_cutoff(records[expired], cutoff):
+        expired += 1
+    if expired:
+        del records[:expired]
+        closed["horizon"] += expired
+    return closed
+
+
+def drop_stream_records(
+    table_name: str,
+    *,
+    preserve_closed: bool = False,
+    table: dict | None = None,
+    account_id: str | None = None,
+    region: str | None = None,
+) -> None:
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    if preserve_closed and table:
+        stream_spec = table.get("StreamSpecification") or {}
+        stream_arn = table.get("LatestStreamArn")
+        if stream_spec.get("StreamEnabled") and stream_arn:
+            _trim_stream_records(table_name, account_id=account_id, region=region)
+            records = _live_stream_records(table_name, account_id, region)
+            _closed_streams.set_scoped(account_id, region, stream_arn, {
+                "TableName": table_name,
+                "StreamArn": stream_arn,
+                "StreamLabel": table.get("LatestStreamLabel", ""),
+                "StreamViewType": stream_spec.get("StreamViewType", "NEW_AND_OLD_IMAGES"),
+                "CreationDateTime": table.get("CreationDateTime", 0),
+                "KeySchema": copy.deepcopy(table.get("KeySchema", [])),
+                "records": copy.deepcopy(records),
+                "horizon": _trimmed_count(table_name, account_id, region),
+                "expires_at": time.time() + _CLOSED_STREAM_RETENTION_SECONDS,
+            })
+    _stream_records.pop_scoped(account_id, region, table_name, None)
+    _stream_trimmed.pop_scoped(account_id, region, table_name, None)
 
 
 def _next_stream_seq():
@@ -690,7 +763,9 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
             "SizeBytes": 0,
             "StreamViewType": view_type,
         },
-        "eventSourceARN": f"{table['TableArn']}/stream/{_stream_label()}",
+        "eventSourceARN": table.get(
+            "LatestStreamArn", f"{table['TableArn']}/stream/{_stream_label()}"
+        ),
     }
 
     ref_item = new_item or old_item or {}
@@ -718,6 +793,9 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
     independent subscriptions — a table can have either, both, or neither.
     Each path is gated independently here; the function name is kept for
     backwards compatibility with existing call sites."""
+    if event_name == "MODIFY" and _ddb_items_equal(old_item, new_item):
+        return
+
     table = _tables.get(table_name)
     if not table:
         return
@@ -800,13 +878,10 @@ def _ttl_reaper():
                             ttl_val = _extract_key_val(ttl_attr)
                             try:
                                 if float(ttl_val) <= now:
-                                    del sk_map[sk_val]
+                                    _remove_item(table, pk_val, sk_val)
                                     logger.debug("TTL expired item %s/%s from %s", pk_val, sk_val, table_name)
                             except (ValueError, TypeError):
                                 pass
-                        if not sk_map:
-                            del table["items"][pk_val]
-                    _update_counts(table)
         except Exception as exc:
             logger.error("TTL reaper error: %s", exc)
 
@@ -992,6 +1067,8 @@ _VALID_KEY_TYPES = {"HASH", "RANGE"}
 _VALID_BILLING_MODES = {"PROVISIONED", "PAY_PER_REQUEST"}
 _VALID_TABLE_CLASSES = {"STANDARD", "STANDARD_INFREQUENT_ACCESS"}
 _VALID_PROJECTION_TYPES = {"ALL", "KEYS_ONLY", "INCLUDE"}
+_MAX_GLOBAL_SECONDARY_INDEXES = 20
+_MAX_LOCAL_SECONDARY_INDEXES = 5
 
 
 def _validate_table_name(name: str) -> tuple | None:
@@ -1010,6 +1087,58 @@ def _validate_table_name(name: str) -> tuple | None:
     if not _TABLE_NAME_RE.match(name):
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
+    return None
+
+
+def _validate_index_name(name: str) -> tuple | None:
+    if not isinstance(name, str) or not name:
+        return error_response_json("ValidationException",
+            "1 validation error detected: Value null at 'indexName' failed to satisfy constraint: Member must not be null", 400)
+    if len(name) < 3 or len(name) > 255 or not _TABLE_NAME_RE.match(name):
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: Invalid index name", 400)
+    return None
+
+
+def _validate_index_projection(index) -> tuple | None:
+    projection = index.get("Projection") or {}
+    projection_type = projection.get("ProjectionType", "ALL")
+    if projection_type not in _VALID_PROJECTION_TYPES:
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Unknown ProjectionType: {projection_type}", 400)
+    non_key_attributes = projection.get("NonKeyAttributes") or []
+    if projection_type == "INCLUDE" and not non_key_attributes:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
+    if projection_type == "KEYS_ONLY" and non_key_attributes:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
+    return None
+
+
+def _validate_secondary_index(index, attr_defs, *, is_lsi=False,
+                              table_pk=None, table_sk=None,
+                              billing_mode=None) -> tuple | None:
+    err = _validate_index_name(index.get("IndexName"))
+    if err:
+        return err
+    err = _validate_key_schema(index.get("KeySchema"), attr_defs)
+    if err:
+        return err
+    err = _validate_index_projection(index)
+    if err:
+        return err
+    hash_key, sort_key = _index_key_names(index)
+    if is_lsi and (hash_key != table_pk or not sort_key):
+        return error_response_json("ValidationException",
+            f"Local Secondary Index '{index.get('IndexName')}' must use the table's hash key and a non-key range key", 400)
+    if billing_mode == "PROVISIONED" and not is_lsi:
+        throughput = index.get("ProvisionedThroughput")
+        if not isinstance(throughput, dict) or min(
+                int(throughput.get("ReadCapacityUnits", 0)),
+                int(throughput.get("WriteCapacityUnits", 0))) <= 0:
+            return error_response_json("ValidationException",
+                "One or more parameter values were invalid: ProvisionedThroughput must be specified for a global secondary index", 400)
     return None
 
 
@@ -1135,6 +1264,12 @@ def _create_table(data):
 
     gsis = copy.deepcopy(data.get("GlobalSecondaryIndexes", []))
     lsis = copy.deepcopy(data.get("LocalSecondaryIndexes", []))
+    if len(gsis) > _MAX_GLOBAL_SECONDARY_INDEXES:
+        return error_response_json("LimitExceededException",
+            "The number of global secondary indexes exceeds the maximum allowed", 400)
+    if len(lsis) > _MAX_LOCAL_SECONDARY_INDEXES:
+        return error_response_json("LimitExceededException",
+            "The number of local secondary indexes exceeds the maximum allowed", 400)
 
     # LSI validation: requires the base table to have a RANGE key, and each LSI
     # must have the same HASH key as the base table.
@@ -1145,10 +1280,12 @@ def _create_table(data):
         return error_response_json("ValidationException",
             "One or more parameter values were invalid: Table KeySchema does not have a range key, which is required when specifying a LocalSecondaryIndex", 400)
     for lsi in lsis:
-        lks = lsi.get("KeySchema") or []
-        if not any(k.get("KeyType") == "HASH" and k.get("AttributeName") == pk_name for k in lks):
-            return error_response_json("ValidationException",
-                f"Local Secondary Index '{lsi.get('IndexName')}' must use the table's hash key", 400)
+        err = _validate_secondary_index(
+            lsi, attr_defs, is_lsi=True, table_pk=pk_name, table_sk=sk_name,
+            billing_mode=billing_mode,
+        )
+        if err:
+            return err
 
     # Duplicate-index-name detection across LSI + GSI.
     seen_index_names = set()
@@ -1160,20 +1297,10 @@ def _create_table(data):
         if iname:
             seen_index_names.add(iname)
 
-    # Validate index Projection settings.
-    for idx in gsis + lsis:
-        idx_name = idx.get("IndexName", "<unnamed>")
-        proj = idx.get("Projection") or {}
-        ptype = proj.get("ProjectionType", "ALL")
-        if ptype not in _VALID_PROJECTION_TYPES:
-            return error_response_json("ValidationException",
-                f"One or more parameter values were invalid: Unknown ProjectionType: {ptype}", 400)
-        if ptype == "INCLUDE" and not proj.get("NonKeyAttributes"):
-            return error_response_json("ValidationException",
-                "One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
-        if ptype == "KEYS_ONLY" and proj.get("NonKeyAttributes"):
-            return error_response_json("ValidationException",
-                "One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
+    for gsi in gsis:
+        err = _validate_secondary_index(gsi, attr_defs, billing_mode=billing_mode)
+        if err:
+            return err
 
     # Validate StreamSpecification: StreamEnabled:false with StreamViewType is invalid.
     stream_spec = data.get("StreamSpecification")
@@ -1222,6 +1349,7 @@ def _create_table(data):
         "pk_name": pk_name,
         "sk_name": sk_name,
         "items": defaultdict(dict),
+        "_secondary_indexes": {},
         "TableStatus": "ACTIVE",
         "CreationDateTime": int(time.time()),
         "ItemCount": 0,
@@ -1258,6 +1386,7 @@ def _create_table(data):
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
         _tags[_tables[name]["TableArn"]] = data["Tags"]
+    _rebuild_secondary_indexes(_tables[name])
     logger.info("DynamoDB table created: %s", name)
     return json_response({"TableDescription": _table_description(name)})
 
@@ -1272,6 +1401,7 @@ def _delete_table(data):
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
     remaining = [r for r in _replica_group(_tables[name]) if r != get_region()]
+    drop_stream_records(name, preserve_closed=True, table=_tables[name])
     del _tables[name]
     if remaining:
         _set_replica_group(name, remaining)
@@ -1279,7 +1409,6 @@ def _delete_table(data):
     _ttl_settings.pop(name, None)
     _pitr_settings.pop(name, None)
     _kinesis_destinations.pop(name, None)
-    drop_stream_records(name)
     return json_response({"TableDescription": desc})
 
 
@@ -1291,15 +1420,21 @@ def _describe_table(data):
 
 
 def _list_tables(data):
-    limit = data.get("Limit", 100)
+    try:
+        limit = int(data.get("Limit", 100))
+    except (TypeError, ValueError):
+        return error_response_json("ValidationException", "Limit must be between 1 and 100", 400)
+    if limit < 1 or limit > 100:
+        return error_response_json("ValidationException", "Limit must be between 1 and 100", 400)
     start = data.get("ExclusiveStartTableName", "")
     names = sorted(_tables.keys())
     if start:
         names = [n for n in names if n > start]
-    names = names[:limit]
-    result = {"TableNames": names}
-    if len(names) == limit and names:
-        result["LastEvaluatedTableName"] = names[-1]
+    has_more = len(names) > limit
+    page = names[:limit]
+    result = {"TableNames": page}
+    if has_more and page:
+        result["LastEvaluatedTableName"] = page[-1]
     return json_response(result)
 
 
@@ -1322,13 +1457,15 @@ def _set_replica_group(name, regions):
 def _create_replica(name, table, region):
     """Copy ``table`` into ``region`` as a replica, with its items."""
     account = get_account_id()
-    replica = copy.deepcopy({k: v for k, v in table.items() if k != "items"})
+    replica = copy.deepcopy({k: v for k, v in table.items()
+                             if k not in ("items", "_secondary_indexes")})
     replica["items"] = defaultdict(dict, copy.deepcopy(dict(table["items"])))
     arn = f"arn:aws:dynamodb:{region}:{account}:table/{name}"
     replica.update({
         "TableArn": arn, "TableId": new_uuid(), "CreationDateTime": int(time.time()),
         "TableStatus": "ACTIVE", "DeletionProtectionEnabled": False,
     })
+    _rebuild_secondary_indexes(replica)
     for index in replica.get("GlobalSecondaryIndexes", []) + replica.get("LocalSecondaryIndexes", []):
         index["IndexArn"] = f"{arn}/index/{index['IndexName']}"
     label = _stream_label()
@@ -1369,11 +1506,14 @@ def _apply_replica_updates(name, table, updates):
                 return error_response_json("ValidationException",
                     "Replica specified in the Replica Update or Replica Delete action of the request was not found.", 400)
             if action == "Delete":
+                replica = _tables.get_scoped(account, region, name)
+                drop_stream_records(
+                    name, preserve_closed=True, table=replica,
+                    account_id=account, region=region,
+                )
                 _tables.pop_scoped(account, region, name, None)
                 _ttl_settings.pop_scoped(account, region, name, None)
                 _pitr_settings.pop_scoped(account, region, name, None)
-                with request_scope(account, region):
-                    drop_stream_records(name)
                 regions.discard(region)
     _set_replica_group(name, regions)
     if len(regions) <= 1:
@@ -1399,12 +1539,9 @@ def _replicate_write(table, event_name, old_item, new_item):
             sk_val = _extract_key_val(item.get(replica["sk_name"])) if replica["sk_name"] else "__no_sort__"
             previous = replica["items"].get(pk_val, {}).get(sk_val)
             if new_item is None:
-                replica["items"].get(pk_val, {}).pop(sk_val, None)
-                if pk_val in replica["items"] and not replica["items"][pk_val]:
-                    del replica["items"][pk_val]
+                _remove_item(replica, pk_val, sk_val)
             else:
-                replica["items"][pk_val][sk_val] = copy.deepcopy(new_item)
-            _update_counts(replica)
+                _set_item(replica, pk_val, sk_val, copy.deepcopy(new_item))
             if new_item is None and previous is None:
                 continue
             replica_event = "REMOVE" if new_item is None else ("MODIFY" if previous else "INSERT")
@@ -1477,6 +1614,8 @@ def _update_table(data):
     if "StreamSpecification" in data:
         stream_spec = data["StreamSpecification"]
         stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
+        if stream_was_enabled and not stream_spec.get("StreamEnabled"):
+            drop_stream_records(name, preserve_closed=True, table=table)
         table["StreamSpecification"] = stream_spec
         if stream_spec.get("StreamEnabled") and not stream_was_enabled:
             stream_label = _stream_label()
@@ -1506,11 +1645,15 @@ def _update_table(data):
         }
 
     existing_idx_names = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])}
+    index_updates = data.get("GlobalSecondaryIndexUpdates", [])
+    if len(index_updates) > 1:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: Only one global secondary index update is allowed per request", 400)
     # A new index's key attributes must all appear in the REQUEST's own
     # AttributeDefinitions — stored definitions do not satisfy the check
     # (measured eu-west-2, 2026-07-12, paritysuite).
     defined_attrs = {a["AttributeName"] for a in data.get("AttributeDefinitions", [])}
-    for update in data.get("GlobalSecondaryIndexUpdates", []):
+    for update in index_updates:
         if "Create" in update:
             gsi_def = copy.deepcopy(update["Create"])
             idx_name = gsi_def.get("IndexName")
@@ -1522,6 +1665,15 @@ def _update_table(data):
                 if k.get("AttributeName") not in defined_attrs:
                     return error_response_json("ValidationException",
                         f"One or more parameter values were invalid: AttributeDefinitions does not contain {k.get('AttributeName')} referenced by GSI {idx_name}", 400)
+            err = _validate_secondary_index(
+                gsi_def, data.get("AttributeDefinitions", []),
+                billing_mode=table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
+            )
+            if err:
+                return err
+            if len(existing_idx_names) >= _MAX_GLOBAL_SECONDARY_INDEXES:
+                return error_response_json("LimitExceededException",
+                    "The number of global secondary indexes exceeds the maximum allowed", 400)
             gsi_def.setdefault("IndexStatus", "ACTIVE")
             gsi_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
             gsi_def.setdefault(
@@ -1564,6 +1716,8 @@ def _update_table(data):
         ad for ad in table.get("AttributeDefinitions", [])
         if ad["AttributeName"] in referenced
     ]
+    if index_updates:
+        _rebuild_secondary_indexes(table)
 
     if data.get("ReplicaUpdates"):
         err = _apply_replica_updates(name, table, data["ReplicaUpdates"])
@@ -1593,7 +1747,7 @@ def _table_description(name):
         desc["GlobalSecondaryIndexes"] = t["GlobalSecondaryIndexes"]
     if t.get("LocalSecondaryIndexes"):
         desc["LocalSecondaryIndexes"] = t["LocalSecondaryIndexes"]
-    if t.get("StreamSpecification"):
+    if (t.get("StreamSpecification") or {}).get("StreamEnabled"):
         desc["StreamSpecification"] = t["StreamSpecification"]
         desc["LatestStreamLabel"] = t.get("LatestStreamLabel", "")
         desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
@@ -1818,8 +1972,7 @@ def _put_item(data):
         if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, old_item)
 
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
 
     event_name = "MODIFY" if old_item else "INSERT"
     _emit_stream_event(name, event_name, old_item, item)
@@ -1910,9 +2063,8 @@ def _delete_item(data):
             return _conditional_check_failed(data, old_item)
 
     if old_item is not None:
-        table["items"].get(pk_val, {}).pop(sk_val, None)
+        _remove_item(table, pk_val, sk_val)
         _emit_stream_event(name, "REMOVE", old_item, None)
-    _update_counts(table)
 
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
@@ -2023,17 +2175,14 @@ def _update_item(data):
         if key_err:
             return key_err
     elif attribute_updates:
+        key_err = _key_attribute_update_error(table, set(attribute_updates.keys()))
+        if key_err:
+            return key_err
         try:
             item = _apply_attribute_updates(item, attribute_updates)
         except _AttributeUpdatesValidationError as exc:
             return error_response_json("ValidationException", str(exc), 400)
         updated_attrs = set(attribute_updates.keys())
-    # AWS rejects any update that would mutate a hash or range key value.
-    for key_name in (table.get("pk_name"), table.get("sk_name")):
-        if key_name and key_name in item and existing is not None:
-            if item.get(key_name) != existing.get(key_name):
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
 
     # AWS rejects updates with invalid values
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
@@ -2044,8 +2193,7 @@ def _update_item(data):
     if err:
         return err
 
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
 
     event_name = "MODIFY" if old_item else "INSERT"
     _emit_stream_event(name, event_name, old_item, item)
@@ -2182,6 +2330,10 @@ def _query(data):
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
             "Consistent reads are not supported on global secondary indexes", 400)
+    if is_gsi:
+        err = _validate_gsi_read_projection(table, index_name, data)
+        if err:
+            return err
 
     # ExclusiveStartKey must contain the base table's key attributes; when
     # querying an index, it must also contain the index's key attributes.
@@ -2285,55 +2437,58 @@ def _query(data):
                 return error_response_json("ValidationException",
                     "The provided starting key does not match the range key predicate", 400)
 
-    if is_gsi or index_name:
-        candidates = []
-        for pk_bucket in table["items"].values():
-            for it in pk_bucket.values():
-                if pk_name in it and _extract_key_val(it[pk_name]) == pk_val:
-                    # Sparse index: for composite GSIs/LSIs, items that have the index
-                    # hash key but are missing the index range key are excluded.
-                    if sk_name and sk_name not in it:
-                        continue
-                    candidates.append(it)
+    if index_name:
+        index = table.get("_secondary_indexes", {}).get(index_name)
+        if index is None:
+            _rebuild_secondary_indexes(table)
+            index = table["_secondary_indexes"].get(index_name)
+        if index is None:
+            candidates, has_more = [], False
+        else:
+            def size_fn(item):
+                if is_gsi:
+                    return _item_size_bytes(
+                        _project_secondary_index_item(item, table, index_name)
+                    )
+                return _item_size_bytes(item)
+
+            try:
+                candidates, has_more = _paginate_evaluated_items(
+                    _iter_secondary_index_candidates(
+                        table, index, pk_val, key_cond, key_conditions, eav, ean,
+                        esk, scan_forward,
+                    ),
+                    limit,
+                    size_fn,
+                )
+            except ValueError as exc:
+                return error_response_json("ValidationException", str(exc), 400)
     else:
         candidates = list(table["items"].get(pk_val, {}).values())
+        if sk_name:
+            sk_type = _get_attr_type(table, sk_name)
+            candidates.sort(key=lambda it: _sort_key_value(it.get(sk_name), sk_type), reverse=not scan_forward)
 
-    if is_gsi or index_name:
-        # GSI/LSI: order by (INDEX_SORT, BASE_PK, BASE_SK). The base-table keys
-        # tiebreak rows with equal INDEX_SORT (or hash-only GSIs), matching
-        # real DynamoDB's hidden ordering and making pagination cursors stable.
-        sort_keys = _index_order_keys(table, sk_name)
-        candidates.sort(
-            key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys),
-            reverse=not scan_forward,
-        )
-    elif sk_name:
-        sk_type = _get_attr_type(table, sk_name)
-        candidates.sort(key=lambda it: _sort_key_value(it.get(sk_name), sk_type), reverse=not scan_forward)
+        if key_conditions:
+            candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
+        elif key_cond:
+            try:
+                candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean, slot="KeyConditionExpression")]
+            except ValueError as exc:
+                return error_response_json("ValidationException", str(exc), 400)
 
-    if key_conditions:
-        candidates = [it for it in candidates if _evaluate_key_conditions_item(it, key_conditions, pk_name)]
-    elif key_cond:
-        try:
-            candidates = [it for it in candidates if _evaluate_condition(key_cond, it, eav, ean, slot="KeyConditionExpression")]
-        except ValueError as exc:
-            return error_response_json("ValidationException", str(exc), 400)
+        if esk:
+            candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
 
-    if esk:
-        candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
-
-    # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
-    # limit — including when the results end exactly at the limit, since it
-    # doesn't look ahead. The follow-up page then returns 0 items and no key.
-    has_more = False
-    if limit is not None and len(candidates) >= limit:
-        has_more = len(candidates) > 0
-        candidates = candidates[:limit]
+        candidates, has_more = _paginate_evaluated_items(candidates, limit)
 
     scanned_count = len(candidates)
     query_filter = data.get("QueryFilter")
     if query_filter and not filter_expr:
-        filtered = [it for it in candidates if _evaluate_legacy_filter(it, query_filter)]
+        filtered = [
+            it for it in candidates
+            if _evaluate_legacy_filter(it, query_filter, data.get("ConditionalOperator", "AND"))
+        ]
     elif filter_expr:
         try:
             filtered = [it for it in candidates if _evaluate_condition(filter_expr, it, eav, ean, slot="FilterExpression")]
@@ -2489,13 +2644,16 @@ def _scan(data):
                 "Consistent reads are not supported on global secondary indexes", 400)
     # Query Limit also validated above for parity.
 
-    all_items = []
-    for pk in sorted(table["items"].keys()):
-        for sk in sorted(table["items"][pk].keys()):
-            all_items.append(table["items"][pk][sk])
-
     if index_name:
+        all_items = []
+        for pk in sorted(table["items"].keys()):
+            for sk in sorted(table["items"][pk].keys()):
+                all_items.append(table["items"][pk][sk])
         pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
+        if is_gsi:
+            err = _validate_gsi_read_projection(table, index_name, data)
+            if err:
+                return err
         if is_gsi:
             # Sparse GSI semantics: items lacking ANY of the index's key
             # attributes (hash, or range on a composite GSI) don't appear.
@@ -2511,7 +2669,7 @@ def _scan(data):
     # Parallel scan: partition items deterministically across segments by
     # hashing the partition key. AWS guarantees segments return disjoint
     # subsets and their union equals the full table scan.
-    if segment is not None and total_segments is not None:
+    if index_name and segment is not None and total_segments is not None:
         import hashlib as _hl
         seg_n = int(segment); ts_n = int(total_segments)
         if index_name:
@@ -2524,6 +2682,7 @@ def _scan(data):
             return (int.from_bytes(h[:4], "big") % ts_n) == seg_n
         all_items = [it for it in all_items if _seg_match(it)]
 
+    scan_start = 0
     if esk:
         # ESK must contain the base-table key attributes (and the index's keys
         # when scanning an index). AWS LastEvaluatedKey always carries both sets;
@@ -2544,21 +2703,59 @@ def _scan(data):
                 all_items, esk, pk_name_idx, sk_name_idx, scan_forward=True, table=table
             )
         else:
-            all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
+            start_pk = _extract_key_val(esk.get(table["pk_name"], {}))
+            if table.get("sk_name"):
+                start_sk = _extract_key_val(esk.get(table["sk_name"], {}))
+            else:
+                start_sk = chr(0x10FFFF)
+            scan_start = bisect.bisect_right(
+                _ensure_scan_keys(table), (start_pk, start_sk)
+            )
 
-    # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
-    # still yields a key, because AWS doesn't look ahead.
-    has_more = False
-    if limit is not None and len(all_items) >= limit:
-        has_more = len(all_items) > 0
-        all_items = all_items[:limit]
+    if not index_name:
+        scan_keys = _ensure_scan_keys(table)
+
+        def _iter_table_scan_items():
+            if segment is not None and total_segments is not None:
+                import hashlib as _hl
+
+                segment_number = int(segment)
+                segment_count = int(total_segments)
+                partition_key_name = table.get("pk_name") or "pk"
+            for key_index in range(scan_start, len(scan_keys)):
+                pk_value, sk_value = scan_keys[key_index]
+                item = table["items"].get(pk_value, {}).get(sk_value)
+                if item is None:
+                    continue
+                if segment is not None and total_segments is not None:
+                    partition_value = _extract_key_val(item.get(partition_key_name, {}))
+                    digest = _hl.sha1(str(partition_value).encode("utf-8")).digest()
+                    if int.from_bytes(digest[:4], "big") % segment_count != segment_number:
+                        continue
+                yield item
+
+        all_items = _iter_table_scan_items()
+
+    size_fn = None
+    if index_name:
+        def size_fn(item):
+            if is_gsi:
+                return _item_size_bytes(
+                    _project_secondary_index_item(item, table, index_name)
+                )
+            return _item_size_bytes(item)
+
+    all_items, has_more = _paginate_evaluated_items(all_items, limit, size_fn)
 
     scanned_count = len(all_items)
 
     # Legacy ScanFilter / QueryFilter support
     scan_filter = data.get("ScanFilter") or data.get("QueryFilter")
     if scan_filter and not filter_expr:
-        filtered = [it for it in all_items if _evaluate_legacy_filter(it, scan_filter)]
+        filtered = [
+            it for it in all_items
+            if _evaluate_legacy_filter(it, scan_filter, data.get("ConditionalOperator", "AND"))
+        ]
     elif filter_expr:
         try:
             filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean, slot="FilterExpression")]
@@ -2826,8 +3023,7 @@ def _partiql_insert(table, parsed):
     if pk_val in table["items"] and sk_val in table["items"][pk_val]:
         return error_response_json("DuplicateItemException",
                                    "Duplicate primary key exists in table", 400)
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
     return json_response({})
 
 
@@ -3127,9 +3323,8 @@ def _partiql_update(table, parsed):
         _partiql_remove_path(work, parts)
         applied_paths.append(parts)
     # Nothing failed — commit the working copy.
-    item.clear()
-    item.update(work)
-    item_after = item
+    _set_item(table, pk_key, sk_key, work)
+    item_after = work
 
     if returning:
         r = returning.upper().strip()
@@ -3175,10 +3370,7 @@ def _partiql_delete(table, parsed):
         return _conditional_check_failed({}, item)
 
     item_before = copy.deepcopy(item) if returning else None
-    del table["items"][pk_key][sk_key]
-    if not table["items"][pk_key]:
-        del table["items"][pk_key]
-    _update_counts(table)
+    _remove_item(table, pk_key, sk_key)
 
     if returning and returning.upper().strip() == "ALL OLD *":
         return json_response({"Items": [item_before] if item_before else []})
@@ -3314,12 +3506,13 @@ def _execute_transaction(data):
 
     # ClientRequestToken idempotency parity with TransactWriteItems.
     crt = data.get("ClientRequestToken")
-    signature = None
+    signature_digest = None
     if crt:
+        _prune_txn_idempotency()
         prior = _txn_idempotency.get(crt)
-        signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
+        signature_digest = _transaction_signature_digest(data)
         if prior is not None:
-            if prior.get("signature") == signature:
+            if prior.get("signature_digest") == signature_digest:
                 replay = {k: v for k, v in prior.get("response", {}).items() if k != "ConsumedCapacity"}
                 if data.get("ReturnConsumedCapacity", "NONE") != "NONE":
                     consumed = []
@@ -3402,6 +3595,8 @@ def _execute_transaction(data):
             tbl = _tables.get(tname)
             if tbl is not None:
                 tbl["items"] = defaultdict(dict, items)
+                _update_counts(tbl)
+                _rebuild_secondary_indexes(tbl)
         idx, code, msg = failure
         reasons = [{"Code": "None"} for _ in statements]
         reasons[idx] = {"Code": code.split("#")[-1], "Message": msg}
@@ -3438,7 +3633,9 @@ def _execute_transaction(data):
                              "WriteCapacityUnits": write_units})
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
+        _txn_idempotency[crt] = {"created_at": time.time(), "signature_digest": signature_digest,
+                                 "response": result, "sizes": txn_sizes}
+        _prune_txn_idempotency()
     return json_response(result)
 
 
@@ -4040,7 +4237,7 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"][pk_val][sk_val] = item
+                _set_item(table, pk_val, sk_val, item)
                 _emit_stream_event(_normalize_table_name(table_name), "MODIFY" if old_item else "INSERT", old_item, item)
                 _accumulate_write_capacity(cap, table, old_item, item)
             elif "DeleteRequest" in req:
@@ -4049,11 +4246,10 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"].get(pk_val, {}).pop(sk_val, None)
+                _remove_item(table, pk_val, sk_val)
                 if old_item:
                     _emit_stream_event(_normalize_table_name(table_name), "REMOVE", old_item, None)
                 _accumulate_write_capacity(cap, table, old_item, None)
-        _update_counts(table)
     result = {"UnprocessedItems": unprocessed}
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
@@ -4160,12 +4356,13 @@ def _transact_write_items(data):
     # raises IdempotentParameterMismatchException.
     crt = data.get("ClientRequestToken")
     if crt:
+        _prune_txn_idempotency()
         prior = _txn_idempotency.get(crt)
         # Drop the ClientRequestToken from the payload signature so equality
         # is on the actual transaction body.
-        signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
+        signature_digest = _transaction_signature_digest(data)
         if prior is not None:
-            if prior.get("signature") == signature:
+            if prior.get("signature_digest") == signature_digest:
                 # A same-token replay does not re-apply the writes; AWS reports
                 # a transactional READ of the stored result, recomputed against
                 # the item sizes (2 x ceil(size/4KB) per item) — measured
@@ -4329,7 +4526,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(item.get(tbl["pk_name"]))
             sk_val = _extract_key_val(item.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"][pk_val][sk_val] = item
+            _set_item(tbl, pk_val, sk_val, item)
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             _txn_write_effects.setdefault(table_name, []).append((old_item, item))
         elif op_type == "Delete":
@@ -4337,7 +4534,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(key.get(tbl["pk_name"]))
             sk_val = _extract_key_val(key.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"].get(pk_val, {}).pop(sk_val, None)
+            _remove_item(tbl, pk_val, sk_val)
             if old_item:
                 _emit_stream_event(table_name, "REMOVE", old_item, None)
             _txn_write_effects.setdefault(table_name, []).append((old_item, None))
@@ -4350,11 +4547,9 @@ def _transact_write_items(data):
             ue = op.get("UpdateExpression", "")
             if ue:
                 item, _ = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
-            tbl["items"][pk_val][sk_val] = item
+            _set_item(tbl, pk_val, sk_val, item)
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             _txn_write_effects.setdefault(table_name, []).append((old_item, item))
-        _update_counts(tbl)
-
     # ConsumedCapacity: a transactional write costs 2 x ceil(size/1KB) WCU per
     # item on the table (measured against real DynamoDB, eu-west-2, by
     # paritysuite); index replication is asynchronous, so index arms carry the
@@ -4392,11 +4587,33 @@ def _transact_write_items(data):
     if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
+        _txn_idempotency[crt] = {"created_at": time.time(), "signature_digest": signature_digest,
+                                 "response": result, "sizes": txn_sizes}
+        _prune_txn_idempotency()
     return json_response(result)
 
 
 _txn_idempotency = AccountRegionScopedDict()
+_TXN_IDEMPOTENCY_MAX_ENTRIES = 10_000
+
+
+def _transaction_signature_digest(data: dict) -> str:
+    payload = {key: value for key, value in data.items() if key != "ClientRequestToken"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _prune_txn_idempotency() -> None:
+    cutoff = time.time() - 600
+    for token, entry in list(_txn_idempotency.items()):
+        if entry.get("created_at", 0) <= cutoff:
+            _txn_idempotency.pop(token, None)
+    while len(_txn_idempotency) > _TXN_IDEMPOTENCY_MAX_ENTRIES:
+        oldest_token = min(
+            _txn_idempotency,
+            key=lambda token: _txn_idempotency[token].get("created_at", 0),
+        )
+        _txn_idempotency.pop(oldest_token, None)
 
 
 def _transact_get_items(data):
@@ -5854,6 +6071,7 @@ def _restore_table_from_backup(data):
     snap = desc.get("_items_snapshot") or {}
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(snap))
     _update_counts(_tables[target])
+    _rebuild_secondary_indexes(_tables[target])
     # AWS attaches a RestoreSummary to the response — clients (Terraform, the
     # AWS SDK) read SourceBackupArn / RestoreInProgress to track the restore.
     _tables[target]["RestoreSummary"] = {
@@ -5893,6 +6111,7 @@ def _restore_table_to_point_in_time(data):
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(dict(src.get("items", {}))))
     _update_counts(_tables[target])
+    _rebuild_secondary_indexes(_tables[target])
     return json_response({"TableDescription": _table_description(target)})
 
 
@@ -6728,10 +6947,6 @@ def _remove_at_path(item, path_parts):
 
 def _compare_ddb(left, op, right):
     if left is None or right is None:
-        if op == '=':
-            return left is None and right is None
-        if op == '<>':
-            return not (left is None and right is None)
         return False
 
     lt, lv = _ddb_comparable(left)
@@ -6819,6 +7034,43 @@ def _ddb_equals(a, b):
     ta, va = _ddb_comparable(a)
     tb, vb = _ddb_comparable(b)
     return ta == tb and va == vb
+
+
+def _ddb_items_equal(left: dict | None, right: dict | None) -> bool:
+    """Compare item images using DynamoDB value semantics."""
+    if left is None or right is None:
+        return left is right
+    if left.keys() != right.keys():
+        return False
+    for key in left:
+        a, b = left[key], right[key]
+        if a.keys() != b.keys():
+            return False
+        attr_type = next(iter(a), None)
+        if attr_type != next(iter(b), None):
+            return False
+        if attr_type == "N":
+            if not _ddb_equals(a, b):
+                return False
+        elif attr_type in ("SS", "NS", "BS"):
+            if attr_type == "NS":
+                if {Decimal(v) for v in a[attr_type]} != {Decimal(v) for v in b[attr_type]}:
+                    return False
+            else:
+                if set(a[attr_type]) != set(b[attr_type]):
+                    return False
+        elif attr_type == "M":
+            if not _ddb_items_equal(a[attr_type], b[attr_type]):
+                return False
+        elif attr_type == "L":
+            if len(a[attr_type]) != len(b[attr_type]):
+                return False
+            if any(not _ddb_items_equal({"value": x}, {"value": y})
+                   for x, y in zip(a[attr_type], b[attr_type])):
+                return False
+        elif a[attr_type] != b[attr_type]:
+            return False
+    return True
 
 
 def _ddb_type(val):
@@ -7148,6 +7400,32 @@ def _key_condition_av(condition, key_conditions, eav, attr_names, key_name):
 # Pagination helpers
 # ---------------------------------------------------------------------------
 
+_DDB_PAGE_SIZE_BYTES = 1_048_576
+
+
+def _paginate_evaluated_items(items, limit, size_fn=None):
+    """Apply DynamoDB's item-count and 1 MiB evaluated-data page limits."""
+    page = []
+    page_bytes = 0
+    has_more = False
+    item_limit = int(limit) if limit is not None else None
+    get_item_size = size_fn or _item_size_bytes
+
+    for item in items:
+        item_bytes = get_item_size(item)
+        if page and page_bytes + item_bytes > _DDB_PAGE_SIZE_BYTES:
+            has_more = True
+            break
+        page.append(item)
+        page_bytes += item_bytes
+        if ((item_limit is not None and len(page) >= item_limit)
+                or page_bytes >= _DDB_PAGE_SIZE_BYTES):
+            has_more = True
+            break
+
+    return page, has_more
+
+
 def _index_order_value(item, name, type_hint):
     """Single position in the GSI/LSI ordering tuple. Hash-only items, sparse
     GSIs, or items missing a key get a stable filler so tuples remain
@@ -7171,6 +7449,281 @@ def _index_order_keys(table, sk_name):
             seen.add(n)
             keys.append((n, _get_attr_type(table, n)))
     return keys
+
+
+class _SecondaryIndexNode:
+    __slots__ = ("key", "base_pk", "base_sk", "priority", "left", "right")
+
+    def __init__(self, key, base_pk, base_sk):
+        self.key = key
+        self.base_pk = base_pk
+        self.base_sk = base_sk
+        self.priority = random.getrandbits(64)
+        self.left = None
+        self.right = None
+
+
+def _rotate_secondary_index_right(root):
+    pivot = root.left
+    root.left = pivot.right
+    pivot.right = root
+    return pivot
+
+
+def _rotate_secondary_index_left(root):
+    pivot = root.right
+    root.right = pivot.left
+    pivot.left = root
+    return pivot
+
+
+def _insert_secondary_index_node(root, node):
+    if root is None:
+        return node
+    if node.key < root.key:
+        root.left = _insert_secondary_index_node(root.left, node)
+        if root.left.priority < root.priority:
+            root = _rotate_secondary_index_right(root)
+    elif node.key > root.key:
+        root.right = _insert_secondary_index_node(root.right, node)
+        if root.right.priority < root.priority:
+            root = _rotate_secondary_index_left(root)
+    return root
+
+
+def _merge_secondary_index_nodes(left, right):
+    if left is None:
+        return right
+    if right is None:
+        return left
+    if left.priority < right.priority:
+        left.right = _merge_secondary_index_nodes(left.right, right)
+        return left
+    right.left = _merge_secondary_index_nodes(left, right.left)
+    return right
+
+
+def _remove_secondary_index_node(root, key):
+    if root is None:
+        return None
+    if key < root.key:
+        root.left = _remove_secondary_index_node(root.left, key)
+    elif key > root.key:
+        root.right = _remove_secondary_index_node(root.right, key)
+    else:
+        return _merge_secondary_index_nodes(root.left, root.right)
+    return root
+
+
+def _iter_secondary_index_nodes(root, scan_forward, cursor=None,
+                                 start_sort_value=None, start_inclusive=True):
+    stack = []
+    node = root
+    while node is not None:
+        if cursor is not None:
+            eligible = node.key > cursor if scan_forward else node.key < cursor
+        elif start_sort_value is not None:
+            sort_value = node.key[0]
+            if scan_forward:
+                eligible = (sort_value > start_sort_value
+                            or (start_inclusive and sort_value == start_sort_value))
+            else:
+                eligible = (sort_value < start_sort_value
+                            or (start_inclusive and sort_value == start_sort_value))
+        else:
+            eligible = True
+        if eligible:
+            stack.append(node)
+            node = node.left if scan_forward else node.right
+        else:
+            node = node.right if scan_forward else node.left
+
+    while stack:
+        node = stack.pop()
+        yield node
+        node = node.right if scan_forward else node.left
+        while node is not None:
+            stack.append(node)
+            node = node.left if scan_forward else node.right
+
+
+def _parse_index_sort_condition(table, index, key_condition,
+                                key_conditions, expression_values,
+                                expression_names):
+    sort_key = index["sort_key"]
+    if not sort_key:
+        return None
+    operator = None
+    values = []
+    if key_conditions:
+        condition = key_conditions.get(sort_key) or {}
+        operator = condition.get("ComparisonOperator")
+        values = condition.get("AttributeValueList") or []
+    else:
+        references = [sort_key] + [
+            alias for alias, name in expression_names.items() if name == sort_key
+        ]
+        for reference in references:
+            escaped = re.escape(reference)
+            pattern = rf"(?<![\w#]){escaped}\s+BETWEEN\s+(:\w+)\s+AND\s+(:\w+)"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                operator = "BETWEEN"
+                values = [expression_values.get(match.group(1)),
+                          expression_values.get(match.group(2))]
+                break
+            pattern = rf"\bbegins_with\s*\(\s*{escaped}\s*,\s*(:\w+)\s*\)"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                operator = "BEGINS_WITH"
+                values = [expression_values.get(match.group(1))]
+                break
+            pattern = rf"(?<![\w#]){escaped}\s*(<=|>=|=|<|>)\s*(:\w+)"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                operator = {"=": "EQ", "<": "LT", "<=": "LE",
+                            ">": "GT", ">=": "GE"}[match.group(1)]
+                values = [expression_values.get(match.group(2))]
+                break
+            pattern = rf"(:\w+)\s*(<=|>=|=|<|>)\s*{escaped}(?![\w#])"
+            match = re.search(pattern, key_condition, re.IGNORECASE)
+            if match:
+                reverse_operator = {"=": "EQ", "<": "GT", "<=": "GE",
+                                    ">": "LT", ">=": "LE"}
+                operator = reverse_operator[match.group(2)]
+                values = [expression_values.get(match.group(1))]
+                break
+    operator = (operator or "").upper()
+    if operator not in {"EQ", "LT", "LE", "GT", "GE", "BETWEEN", "BEGINS_WITH"}:
+        return None
+    if not values or any(value is None for value in values):
+        return None
+    type_hint = _get_attr_type(table, sort_key)
+    return operator, tuple(_sort_key_value(value, type_hint) for value in values)
+
+
+def _prefix_successor(prefix):
+    if isinstance(prefix, bytes):
+        value = bytearray(prefix)
+        for index in range(len(value) - 1, -1, -1):
+            if value[index] < 255:
+                return bytes(value[:index] + bytes([value[index] + 1]))
+        return None
+    if isinstance(prefix, str):
+        for index in range(len(prefix) - 1, -1, -1):
+            codepoint = ord(prefix[index])
+            if codepoint < 0x10FFFF:
+                return prefix[:index] + chr(codepoint + 1)
+    return None
+
+
+def _index_sort_bounds(condition):
+    if condition is None:
+        return {}
+    operator, values = condition
+    if operator == "EQ":
+        return {"lower": (values[0], True), "upper": (values[0], True)}
+    if operator == "GT":
+        return {"lower": (values[0], False)}
+    if operator == "GE":
+        return {"lower": (values[0], True)}
+    if operator == "LT":
+        return {"upper": (values[0], False)}
+    if operator == "LE":
+        return {"upper": (values[0], True)}
+    if operator == "BETWEEN":
+        return {"lower": (values[0], True), "upper": (values[1], True)}
+    if operator == "BEGINS_WITH":
+        successor = _prefix_successor(values[0])
+        bounds = {"lower": (values[0], True), "prefix": values[0]}
+        if successor is not None:
+            bounds["upper"] = (successor, False)
+        return bounds
+    return {}
+
+
+def _index_sort_value_in_bounds(value, bounds):
+    lower = bounds.get("lower")
+    if lower and (value < lower[0] or (value == lower[0] and not lower[1])):
+        return False
+    upper = bounds.get("upper")
+    if upper and (value > upper[0] or (value == upper[0] and not upper[1])):
+        return False
+    prefix = bounds.get("prefix")
+    if prefix is not None and (not isinstance(value, type(prefix)) or not value.startswith(prefix)):
+        return False
+    return True
+
+
+def _index_sort_range_ended(value, bounds, scan_forward):
+    if scan_forward:
+        upper = bounds.get("upper")
+        if upper and (value > upper[0] or (value == upper[0] and not upper[1])):
+            return True
+        prefix = bounds.get("prefix")
+        if prefix is not None:
+            successor = bounds.get("upper")
+            return successor is not None and value >= successor[0]
+    else:
+        lower = bounds.get("lower")
+        if lower and (value < lower[0] or (value == lower[0] and not lower[1])):
+            return True
+        prefix = bounds.get("prefix")
+        if prefix is not None:
+            return value < prefix
+    return False
+
+
+def _iter_secondary_index_candidates(table, index, partition_value,
+                                     key_condition, key_conditions,
+                                     expression_values, expression_names,
+                                     exclusive_start_key, scan_forward):
+    root = index["roots"].get(partition_value)
+    if root is None:
+        return
+    condition = _parse_index_sort_condition(
+        table, index, key_condition, key_conditions,
+        expression_values, expression_names,
+    )
+    bounds = _index_sort_bounds(condition)
+    cursor = None
+    start_sort_value = None
+    start_inclusive = True
+    if exclusive_start_key:
+        cursor = tuple(
+            _index_order_value(exclusive_start_key, name, type_hint)
+            for name, type_hint in index["order_keys"]
+        )
+    elif "prefix" in bounds:
+        if scan_forward:
+            start_sort_value = bounds["prefix"]
+        elif "upper" in bounds:
+            start_sort_value = bounds["upper"][0]
+            start_inclusive = False
+    elif scan_forward and "lower" in bounds:
+        start_sort_value, start_inclusive = bounds["lower"]
+    elif not scan_forward and "upper" in bounds:
+        start_sort_value, start_inclusive = bounds["upper"]
+
+    for node in _iter_secondary_index_nodes(
+            root, scan_forward, cursor, start_sort_value, start_inclusive):
+        if index["sort_key"]:
+            sort_value = node.key[0]
+            if _index_sort_range_ended(sort_value, bounds, scan_forward):
+                break
+            if not _index_sort_value_in_bounds(sort_value, bounds):
+                continue
+        item = table["items"].get(node.base_pk, {}).get(node.base_sk)
+        if item is None:
+            continue
+        if key_conditions:
+            if not _evaluate_key_conditions_item(item, key_conditions, index["hash_key"]):
+                continue
+        elif key_condition and not _evaluate_condition(
+                key_condition, item, expression_values, expression_names,
+                slot="KeyConditionExpression"):
+            continue
+        yield item
 
 
 def _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward=True, table=None):
@@ -7261,18 +7814,82 @@ def _apply_projection(item, data):
 def _apply_index_projection(item, table, index_name):
     """Restrict an item to the attributes that the queried index actually
     projects. AWS GSIs/LSIs declare a Projection of ALL / KEYS_ONLY / INCLUDE
-    [NonKeyAttributes]; only those attributes are visible through the index.
-    Returns the trimmed dict (with original wrapping)."""
+    [NonKeyAttributes]. GSI reads may access only that projection; an LSI can
+    fetch missing attributes from the base table, so its read view is the full
+    item."""
     if not index_name:
         return item
-    idx_def = None
+    _, _, is_gsi = _resolve_index_keys(table, index_name)
+    if not is_gsi:
+        return item
+    return _project_secondary_index_item(item, table, index_name)
+
+
+def _secondary_index_definition(table, index_name):
     for collection in ("GlobalSecondaryIndexes", "LocalSecondaryIndexes"):
-        for idx in (table.get(collection) or []):
-            if idx.get("IndexName") == index_name:
-                idx_def = idx
-                break
-        if idx_def:
-            break
+        for index in table.get(collection) or []:
+            if index.get("IndexName") == index_name:
+                return index
+    return None
+
+
+def _secondary_index_projected_attributes(table, index_name):
+    index = _secondary_index_definition(table, index_name)
+    if index is None:
+        return set()
+    attributes = {table.get("pk_name"), table.get("sk_name")}
+    attributes.update(
+        key.get("AttributeName") for key in index.get("KeySchema") or []
+    )
+    projection = index.get("Projection") or {}
+    if projection.get("ProjectionType", "ALL") == "ALL":
+        return None
+    if projection.get("ProjectionType") == "INCLUDE":
+        attributes.update(projection.get("NonKeyAttributes") or [])
+    attributes.discard(None)
+    return attributes
+
+
+def _expression_root_names(expression, attribute_names):
+    if not expression:
+        return set()
+    names = set()
+    tokens = _tokenize(expression)
+    for position, token in enumerate(tokens):
+        token_type, token_value = token
+        previous_type = tokens[position - 1][0] if position else None
+        if token_type == "NAME_REF" and previous_type != "DOT":
+            names.add(attribute_names.get(token_value, token_value))
+        elif token_type == "IDENT" and previous_type != "DOT":
+            if (token_value.lower() not in _DDB_EXPR_FUNCTIONS
+                    and token_value.upper() not in {"AND", "OR", "NOT", "BETWEEN", "IN"}):
+                names.add(token_value)
+    return names
+
+
+def _validate_gsi_read_projection(table, index_name, data):
+    projected = _secondary_index_projected_attributes(table, index_name)
+    if projected is None:
+        return None
+    attribute_names = data.get("ExpressionAttributeNames", {})
+    requested = set(data.get("AttributesToGet") or [])
+    requested.update(_expression_root_names(
+        data.get("ProjectionExpression", ""), attribute_names
+    ))
+    requested.update(_expression_root_names(
+        data.get("FilterExpression", ""), attribute_names
+    ))
+    unprojected = sorted(requested - projected)
+    if unprojected:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: Global secondary index "
+            f"{index_name} does not project {unprojected}", 400)
+    return None
+
+
+def _project_secondary_index_item(item, table, index_name):
+    """Return the attributes physically stored by a secondary-index entry."""
+    idx_def = _secondary_index_definition(table, index_name)
     if not idx_def:
         return item
     proj_cfg = idx_def.get("Projection") or {}
@@ -7509,6 +8126,150 @@ def _update_counts(table):
     table["TableSizeBytes"] = count * 200
 
 
+def _index_key_names(index):
+    hash_key = sort_key = None
+    for key in index.get("KeySchema", []):
+        if key.get("KeyType") == "HASH":
+            hash_key = key.get("AttributeName")
+        elif key.get("KeyType") == "RANGE":
+            sort_key = key.get("AttributeName")
+    return hash_key, sort_key
+
+
+def _rebuild_secondary_indexes(table):
+    table["_scan_keys"] = sorted(
+        (base_pk, base_sk)
+        for base_pk, base_items in table["items"].items()
+        for base_sk in base_items
+    )
+    indexes = {}
+    for definition in (table.get("GlobalSecondaryIndexes", [])
+                       + table.get("LocalSecondaryIndexes", [])):
+        hash_key, sort_key = _index_key_names(definition)
+        definition["ItemCount"] = 0
+        definition["IndexSizeBytes"] = 0
+        indexes[definition["IndexName"]] = {
+            "name": definition["IndexName"],
+            "definition": definition,
+            "hash_key": hash_key,
+            "sort_key": sort_key,
+            "order_keys": _index_order_keys(table, sort_key),
+            "roots": {},
+        }
+    table["_secondary_indexes"] = indexes
+    for base_pk, base_items in table["items"].items():
+        for base_sk, item in base_items.items():
+            _add_item_to_secondary_indexes(table, base_pk, base_sk, item)
+
+
+def _secondary_index_entry(table, index, item):
+    hash_key = index["hash_key"]
+    sort_key = index["sort_key"]
+    if not hash_key or hash_key not in item or (sort_key and sort_key not in item):
+        return None
+    return _project_secondary_index_item(item, table, index["name"])
+
+
+def _add_item_to_secondary_indexes(table, base_pk, base_sk, item, skip_names=frozenset()):
+    for index in table.get("_secondary_indexes", {}).values():
+        if index["name"] in skip_names:
+            continue
+        entry = _secondary_index_entry(table, index, item)
+        if entry is None:
+            continue
+        hash_key = index["hash_key"]
+        hash_value = _extract_key_val(item[hash_key])
+        key = tuple(
+            _index_order_value(item, name, type_hint)
+            for name, type_hint in index["order_keys"]
+        )
+        root = index["roots"].get(hash_value)
+        index["roots"][hash_value] = _insert_secondary_index_node(
+            root, _SecondaryIndexNode(key, base_pk, base_sk)
+        )
+        definition = index["definition"]
+        definition["ItemCount"] += 1
+        definition["IndexSizeBytes"] += _item_size_bytes(entry) + 100
+
+
+def _remove_item_from_secondary_indexes(table, base_pk, base_sk, item, skip_names=frozenset()):
+    for index in table.get("_secondary_indexes", {}).values():
+        if index["name"] in skip_names:
+            continue
+        entry = _secondary_index_entry(table, index, item)
+        if entry is None:
+            continue
+        hash_key = index["hash_key"]
+        hash_value = _extract_key_val(item[hash_key])
+        root = index["roots"].get(hash_value)
+        if root is None:
+            continue
+        key = tuple(
+            _index_order_value(item, name, type_hint)
+            for name, type_hint in index["order_keys"]
+        )
+        root = _remove_secondary_index_node(root, key)
+        if root is None:
+            del index["roots"][hash_value]
+        else:
+            index["roots"][hash_value] = root
+        definition = index["definition"]
+        definition["ItemCount"] = max(0, definition["ItemCount"] - 1)
+        definition["IndexSizeBytes"] = max(
+            0, definition["IndexSizeBytes"] - _item_size_bytes(entry) - 100
+        )
+
+
+def _ensure_scan_keys(table):
+    scan_keys = table.get("_scan_keys")
+    if not isinstance(scan_keys, list) or len(scan_keys) != table.get("ItemCount", 0):
+        scan_keys = sorted(
+            (base_pk, base_sk)
+            for base_pk, base_items in table["items"].items()
+            for base_sk in base_items
+        )
+        table["_scan_keys"] = scan_keys
+    return scan_keys
+
+
+def _set_item(table, pk_val, sk_val, item):
+    scan_keys = _ensure_scan_keys(table)
+    old_item = table["items"].get(pk_val, {}).get(sk_val)
+    unchanged_indexes = set()
+    if old_item is not None:
+        for index in table.get("_secondary_indexes", {}).values():
+            if (_secondary_index_entry(table, index, old_item)
+                    == _secondary_index_entry(table, index, item)):
+                unchanged_indexes.add(index["name"])
+        _remove_item_from_secondary_indexes(
+            table, pk_val, sk_val, old_item, unchanged_indexes
+        )
+    else:
+        table["ItemCount"] = table.get("ItemCount", 0) + 1
+        bisect.insort(scan_keys, (pk_val, sk_val))
+    table["items"][pk_val][sk_val] = item
+    _add_item_to_secondary_indexes(table, pk_val, sk_val, item, unchanged_indexes)
+    table["TableSizeBytes"] = table["ItemCount"] * 200
+    return old_item
+
+
+def _remove_item(table, pk_val, sk_val):
+    scan_keys = _ensure_scan_keys(table)
+    old_item = table["items"].get(pk_val, {}).get(sk_val)
+    if old_item is None:
+        return None
+    key_position = bisect.bisect_left(scan_keys, (pk_val, sk_val))
+    if key_position < len(scan_keys) and scan_keys[key_position] == (pk_val, sk_val):
+        scan_keys.pop(key_position)
+    _remove_item_from_secondary_indexes(table, pk_val, sk_val, old_item)
+    del table["items"][pk_val][sk_val]
+    if not table["items"][pk_val]:
+        del table["items"][pk_val]
+    table["ItemCount"] = max(0, table.get("ItemCount", 0) - 1)
+    table["TableSizeBytes"] = table["ItemCount"] * 200
+    return old_item
+
+
 def _check_legacy_comparison(item_val, op, attr_vals):
     """Evaluate a single legacy ComparisonOperator against an item attribute.
 
@@ -7526,7 +8287,7 @@ def _check_legacy_comparison(item_val, op, attr_vals):
     if op == "EQ":
         return item_val is not None and _ddb_equals(item_val, attr_vals[0])
     if op == "NE":
-        return item_val is None or not _ddb_equals(item_val, attr_vals[0])
+        return item_val is not None and not _ddb_equals(item_val, attr_vals[0])
     if op in ("LE", "LT", "GE", "GT"):
         sym = {"LE": "<=", "LT": "<", "GE": ">=", "GT": ">"}[op]
         return item_val is not None and _compare_ddb(item_val, sym, attr_vals[0])
@@ -7570,14 +8331,18 @@ def _check_legacy_comparison(item_val, op, attr_vals):
     return True
 
 
-def _evaluate_legacy_filter(item, scan_filter):
-    """Evaluate legacy ScanFilter/QueryFilter conditions (implicit AND)."""
+def _evaluate_legacy_filter(item, scan_filter, conditional_operator="AND"):
+    """Evaluate legacy ScanFilter/QueryFilter conditions."""
+    results = []
     for attr_name, condition in scan_filter.items():
         op = condition.get("ComparisonOperator", "")
         attr_vals = condition.get("AttributeValueList", [])
-        if not _check_legacy_comparison(item.get(attr_name), op, attr_vals):
-            return False
-    return True
+        results.append(_check_legacy_comparison(item.get(attr_name), op, attr_vals))
+    if not results:
+        return True
+    if conditional_operator == "OR":
+        return any(results)
+    return all(results)
 
 
 def _evaluate_expected(item, expected, conditional_operator="AND"):
@@ -7888,6 +8653,7 @@ def reset():
         _ttl_settings.clear()
         _pitr_settings.clear()
         _stream_records.clear()
+        _closed_streams.clear()
         _stream_trimmed.clear()
         _kinesis_destinations.clear()
         _backups.clear()
