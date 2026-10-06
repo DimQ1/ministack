@@ -142,6 +142,10 @@ def _parse_ts(value):
     """Parse ISO-8601 string, epoch float, or None into a Unix timestamp."""
     if value is None:
         return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
@@ -197,6 +201,31 @@ def _evict_old_metrics():
 def _calc_stats(values):
     if not values:
         return {}
+    if isinstance(values[0], dict):
+        sample_count = 0.0
+        total_sum = 0.0
+        minimum = None
+        maximum = None
+        for point in values:
+            value = float(point.get("Value", 0))
+            summary = point.get("_stat") or {}
+            count = float(summary.get("SampleCount", point.get("_sample_count", 1)))
+            point_sum = float(summary.get("Sum", point.get("_sum", value * count)))
+            point_min = float(summary.get("Minimum", point.get("_minimum", value)))
+            point_max = float(summary.get("Maximum", point.get("_maximum", value)))
+            sample_count += count
+            total_sum += point_sum
+            minimum = point_min if minimum is None else min(minimum, point_min)
+            maximum = point_max if maximum is None else max(maximum, point_max)
+        if sample_count <= 0:
+            return {}
+        return {
+            "SampleCount": sample_count,
+            "Sum": total_sum,
+            "Average": total_sum / sample_count,
+            "Minimum": minimum,
+            "Maximum": maximum,
+        }
     return {
         "SampleCount": float(len(values)),
         "Sum": sum(values),
@@ -243,9 +272,48 @@ def _stat_value(stats, stat_name, values=None):
         return stats[stat_name]
     if _is_percentile_stat(stat_name):
         if values:
+            if isinstance(values[0], dict):
+                return _weighted_percentile(values, float(stat_name[1:]))
             return _percentile(values, float(stat_name[1:]))
         return stats.get("Average", 0)
     return stats.get("Average", 0)
+
+
+def _weighted_percentile(points, percentile):
+    weighted_values = []
+    for point in points:
+        summary = point.get("_stat") or {}
+        count = float(summary.get("SampleCount", point.get("_sample_count", 1)))
+        value = float(point.get("Value", 0))
+        minimum = float(summary.get("Minimum", value))
+        maximum = float(summary.get("Maximum", value))
+        if minimum < 0 or (count != 1 and minimum != maximum):
+            return None
+        if count > 0:
+            weighted_values.append((value, count))
+    if not weighted_values:
+        return 0
+    weighted_values.sort(key=lambda pair: pair[0])
+    sample_count = sum(count for _value, count in weighted_values)
+    if sample_count <= 1:
+        return weighted_values[0][0]
+
+    rank = percentile / 100.0 * (sample_count - 1)
+
+    def value_at(index):
+        cumulative = 0.0
+        for value, count in weighted_values:
+            if index < cumulative + count:
+                return value
+            cumulative += count
+        return weighted_values[-1][0]
+
+    lower = int(rank)
+    upper = min(lower + 1, int(sample_count - 1))
+    fraction = rank - lower
+    lower_value = value_at(lower)
+    upper_value = value_at(upper)
+    return lower_value + fraction * (upper_value - lower_value)
 
 
 # ---------------------------------------------------------------------------
@@ -273,12 +341,13 @@ def _evaluate_alarm(alarm):
     if not recent:
         return
 
-    recent_values = [p["Value"] for p in recent]
-    stats = _calc_stats(recent_values)
+    stats = _calc_stats(recent)
     # an alarm is configured with either Statistic (basic) or ExtendedStatistic (percentile),
     # never both thus prefer whichever is set.
     stat_name = alarm.get("ExtendedStatistic") or alarm.get("Statistic", "Average")
-    val = _stat_value(stats, stat_name, recent_values)
+    val = _stat_value(stats, stat_name, recent)
+    if val is None:
+        return
     threshold = alarm.get("Threshold", 0)
     op = alarm.get("ComparisonOperator", "")
 
@@ -504,16 +573,22 @@ def _put_metric_data(params, cbor_data, is_cbor, is_json=False):
                 values = md["Values"]
                 counts = md.get("Counts", [1.0] * len(values))
                 for v, c in zip(values, counts):
-                    for _ in range(int(c)):
-                        _metric_bucket((namespace, mn, _dims_key(dims))).append(
-                            {
-                                "Timestamp": _parse_ts(md.get("Timestamp"))
-                                or time.time(),
-                                "Value": float(v),
-                                "Unit": md.get("Unit", "None"),
-                                "Dimensions": dims,
-                            }
-                        )
+                    value = float(v)
+                    sample_count = float(c)
+                    if sample_count <= 0:
+                        continue
+                    _metric_bucket((namespace, mn, _dims_key(dims))).append({
+                        "Timestamp": _parse_ts(md.get("Timestamp")) or time.time(),
+                        "Value": value,
+                        "Unit": md.get("Unit", "None"),
+                        "Dimensions": dims,
+                        "_stat": {
+                            "SampleCount": sample_count,
+                            "Sum": value * sample_count,
+                            "Minimum": value,
+                            "Maximum": value,
+                        },
+                    })
             elif "StatisticValues" in md:
                 sv = md["StatisticValues"]
                 _metric_bucket((namespace, mn, _dims_key(dims))).append(
@@ -689,12 +764,12 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
     buckets = defaultdict(list)
     for pt in all_points:
         bucket_ts = int(pt["Timestamp"] // period) * period
-        buckets[bucket_ts].append(pt["Value"])
+        buckets[bucket_ts].append(pt)
 
     datapoints = []
     for ts in sorted(buckets):
-        vals = buckets[ts]
-        stats = _calc_stats(vals)
+        points = buckets[ts]
+        stats = _calc_stats(points)
         dp = {
             "Timestamp": _ts_iso(ts),
             "Unit": all_points[0]["Unit"] if all_points else "None",
@@ -839,15 +914,18 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
 
         buckets = defaultdict(list)
         for pt in all_pts:
-            buckets[int(pt["Timestamp"] // period) * period].append(pt["Value"])
+            buckets[int(pt["Timestamp"] // period) * period].append(pt)
 
         timestamps = []
         values = []
         for ts in sorted(buckets):
-            bucket_values = buckets[ts]
-            stats = _calc_stats(bucket_values)
+            bucket_points = buckets[ts]
+            stats = _calc_stats(bucket_points)
+            value = _stat_value(stats, stat_name, bucket_points)
+            if value is None:
+                continue
             timestamps.append(_ts_iso(ts))
-            values.append(_stat_value(stats, stat_name, bucket_values))
+            values.append(value)
 
         if return_data:
             results.append(
