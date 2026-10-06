@@ -1111,6 +1111,10 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
     try:
         mod = _get_module("sqs")
         now = time.time()
+        queue_name_filter = None
+        queue_account_filter = None
+        if queue_url_filter is not None:
+            queue_account_filter, queue_name_filter = mod._queue_ref_from_urlish(queue_url_filter)
 
         # Legacy AccountScopedDict state is keyed by (account_id, queue_url);
         # AccountRegionScopedDict state is keyed by (account_id, region, queue_url).
@@ -1132,13 +1136,18 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
                 continue
             if region_filter is not None and region != region_filter:
                 continue
-            if queue_url_filter is not None and qurl != queue_url_filter:
-                continue
             if not isinstance(queue, dict):
                 continue
+            if queue_url_filter is not None:
+                if queue.get("name") != queue_name_filter:
+                    continue
+                if queue_account_filter and acct != queue_account_filter:
+                    continue
             msgs = queue.get("messages") or []
             rendered = []
             for m in msgs:
+                if m is None:
+                    continue
                 rendered.append(
                     {
                         "MessageId": m.get("id"),
@@ -1157,7 +1166,8 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
                         "SequenceNumber": m.get("seq"),
                     }
                 )
-            per_account.setdefault(acct, {}).setdefault(region, {})[qurl] = rendered
+            display_qurl = queue_url_filter if queue_url_filter is not None else qurl
+            per_account.setdefault(acct, {}).setdefault(region, {})[display_qurl] = rendered
 
         response = {"messages": per_account}
     except Exception as e:
