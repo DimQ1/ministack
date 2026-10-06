@@ -1885,7 +1885,12 @@ def test_s3_central_restore_preserves_metadata_and_objects(monkeypatch, tmp_path
         with request_scope(account, "us-east-1"):
             for name in ("bucket", "empty-bucket"):
                 bucket = s3._buckets[name]
-                assert {key: value for key, value in bucket.items() if key != "objects"} == bucket_meta
+                assert {
+                    key: value for key, value in bucket.items()
+                    if key not in {"objects", "_keys"}
+                } == bucket_meta
+                assert "_keys" not in s3.get_state()["buckets_meta"][name]
+            assert s3._buckets["bucket"]["_keys"] == ["key"]
             obj = s3._buckets["bucket"]["objects"]["key"]
             assert s3._read_body("bucket", "key", obj) == account.encode()
             assert s3._buckets["empty-bucket"]["objects"] == {}

@@ -26,7 +26,9 @@ Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
 Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
+import asyncio
 import base64
+import bisect
 import contextvars
 import copy
 import datetime as _dt
@@ -81,6 +83,10 @@ from ministack.core.sigv4 import (
 )
 
 logger = logging.getLogger("s3")
+_large_body_hashes: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "s3_large_body_hashes", default=None
+)
+_S3_LARGE_BODY_OFFLOAD_BYTES = 1024 * 1024
 
 S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 XML_DECL = b'<?xml version="1.0" encoding="UTF-8"?>'
@@ -195,7 +201,7 @@ def get_state():
     # Use _data directly to capture ALL accounts, not just the current one.
     buckets_meta = AccountScopedDict()
     for scoped_key, bkt in _buckets._data.items():
-        meta = {k: v for k, v in bkt.items() if k != "objects"}
+        meta = {k: v for k, v in bkt.items() if k not in {"objects", "_keys"}}
         buckets_meta._data[scoped_key] = meta
     state = {"buckets_meta": copy.deepcopy(buckets_meta)}
     for key, d in _PERSISTED_BUCKET_DICTS.items():
@@ -1070,7 +1076,7 @@ def _reject_response_overrides_if_unsigned(
     )
 
 
-def _validate_content_md5(headers: dict, body: bytes):
+def _validate_content_md5(headers: dict, body: bytes, md5_digest: bytes | None = None):
     md5_header = headers.get("content-md5", "")
     if not md5_header:
         return None
@@ -1083,7 +1089,7 @@ def _validate_content_md5(headers: dict, body: bytes):
     # for a well-formed digest that simply doesn't match the body). (#1322)
     if len(expected) != 16:
         return _error("InvalidDigest", "The Content-MD5 you specified is not valid.", 400)
-    actual = hashlib.md5(body).digest()
+    actual = md5_digest if md5_digest is not None else hashlib.md5(body).digest()
     if expected != actual:
         return _error(
             "BadDigest",
@@ -1463,7 +1469,29 @@ def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
     return None
 
 
-def _resolve_object_checksums(body: bytes, headers: dict):
+def _prepare_large_body_hashes(body: bytes, headers: dict) -> dict:
+    algorithms = {
+        algorithm.upper().replace("_", "")
+        for algorithm in [
+            *(name for name in _S3_CHECKSUM_HEADERS
+              if headers.get(f"x-amz-checksum-{name}")),
+            headers.get("x-amz-sdk-checksum-algorithm", ""),
+        ]
+        if algorithm
+    }
+    md5_digest = hashlib.md5(body).digest()
+    return {
+        "md5_digest": md5_digest,
+        "md5_hex": md5_digest.hex(),
+        "checksums": {
+            algorithm: checksum
+            for algorithm in algorithms
+            if (checksum := _compute_s3_checksum(algorithm, body)) is not None
+        },
+    }
+
+
+def _resolve_object_checksums(body: bytes, headers: dict, precomputed: dict | None = None):
     """Build the stored checksum dict and validate any client-supplied values.
 
     AWS PutObject contract:
@@ -1513,7 +1541,8 @@ def _resolve_object_checksums(body: bytes, headers: dict):
     # stored and echoed as if it had been.
     checksums = dict(provided)
     for alg, supplied in provided.items():
-        computed = _compute_s3_checksum(alg, body)
+        computed = ((precomputed or {}).get("checksums", {}).get(alg)
+                    or _compute_s3_checksum(alg, body))
         if computed is not None and supplied != computed:
             return {}, _error(
                 "BadDigest",
@@ -1523,7 +1552,8 @@ def _resolve_object_checksums(body: bytes, headers: dict):
 
     if sdk_alg_raw:
         sdk_key = sdk_alg_raw.upper().replace("_", "")
-        computed = _compute_s3_checksum(sdk_alg_raw, body)
+        computed = ((precomputed or {}).get("checksums", {}).get(sdk_key)
+                    or _compute_s3_checksum(sdk_alg_raw, body))
         if computed is not None:
             checksums[sdk_key] = computed
     return checksums, None
@@ -1864,7 +1894,17 @@ async def handle_request(
         resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
         return status, resp_headers, resp_body
 
-    result = _dispatch(method, bucket, key, headers, body, query_params)
+    prepared_hashes = None
+    if (method == "PUT" and bucket and key and not query_params
+            and len(body) >= _S3_LARGE_BODY_OFFLOAD_BYTES):
+        prepared_hashes = await asyncio.to_thread(
+            _prepare_large_body_hashes, body, headers
+        )
+    hashes_token = _large_body_hashes.set(prepared_hashes)
+    try:
+        result = _dispatch(method, bucket, key, headers, body, query_params)
+    finally:
+        _large_body_hashes.reset(hashes_token)
 
     status, resp_headers, resp_body = result
     resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -2145,7 +2185,24 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
     if name in _buckets:
-        # Idempotent: same account already owns it — return 200 like real AWS
+        requested_region = get_region()
+        if body:
+            try:
+                root = fromstring(body)
+                location = _find_xml_tag(root, "LocationConstraint")
+                if location is not None and location.text:
+                    requested_region = location.text
+            except Exception:
+                pass
+        existing_region = _buckets[name].get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        if requested_region != existing_region or existing_region != "us-east-1":
+            return _error(
+                "BucketAlreadyOwnedByYou",
+                "Your previous request to create the named bucket succeeded and you already own it.",
+                409,
+                f"/{name}",
+            )
+        _bucket_acl[name] = _canned_acl_policy_xml(canned_acl or "private", _canonical_owner_id())
         return 200, {"Location": f"/{name}"}, b""
     if _bucket_owner_account(name) is not None:
         # "After creating a general purpose bucket in the shared global
@@ -3625,18 +3682,10 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str,
         return
 
     body = json.dumps(event_payload)
-    now = time.time()
-    msg = {
-        "id": new_uuid(),
-        "body": body,
-        "md5": hashlib.md5(body.encode()).hexdigest(),
-        "receipt_handle": None,
-        "sent_at": now,
-        "visible_at": now,
-        "receive_count": 0,
-    }
-    _sqs._ensure_msg_fields(msg)
-    queue["messages"].append(msg)
+    if queue.get("is_fifo"):
+        logger.warning("S3 notification: FIFO SQS destinations are unsupported (%s)", queue_name)
+        return
+    _sqs.enqueue_internal(queue, body)
     logger.info("S3 notification → SQS %s", queue_name)
 
 
@@ -3769,7 +3818,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    md5_err = _validate_content_md5(headers, body)
+    prepared_hashes = _large_body_hashes.get()
+    md5_digest = prepared_hashes.get("md5_digest") if prepared_hashes else None
+    md5_err = _validate_content_md5(headers, body, md5_digest)
     if md5_err:
         return md5_err
 
@@ -3781,7 +3832,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if precondition_err:
         return precondition_err
 
-    checksums, csum_err = _resolve_object_checksums(body, headers)
+    checksums, csum_err = _resolve_object_checksums(body, headers, prepared_hashes)
     if csum_err:
         return csum_err
 
@@ -3797,24 +3848,22 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
-    etag = f'"{md5_hash(body)}"'
+    etag_digest = prepared_hashes.get("md5_hex") if prepared_hashes else md5_hash(body)
+    etag = f'"{etag_digest}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
     obj["preserved_headers"].update(sse_headers)
-    prior_obj = bucket["objects"].get(key)
-    bucket["objects"][key] = obj
-
-    # --- Object Lock headers on PutObject ---
-    _apply_object_lock_from_headers(bucket_name, key, headers)
-
-    # --- x-amz-tagging header on PutObject ---
-    # Parse + validate up front so the count error returns before persist/event,
-    # but defer the dict write until version_id is assigned (tags are per-version).
+    # Validate tags before mutating the current object; AWS rejects the entire
+    # PUT when the tag limit is exceeded.
     pending_tags = None
     tagging_header = headers.get("x-amz-tagging", "")
     if tagging_header:
         pending_tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
         if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
+
+    prior_obj = bucket["objects"].get(key)
+    _store_bucket_object(bucket, key, obj)
+    _apply_object_lock_from_headers(bucket_name, key, headers)
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(sse_headers)
@@ -3833,6 +3882,8 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             dest_name, replica_version = obj["_replica"]
             _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
             _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
@@ -4052,7 +4103,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     obj = _build_object_record(file_value, synth, etag=etag)
     obj["preserved_headers"].update(sse_headers)
     prior_obj = bucket["objects"].get(key)
-    bucket["objects"][key] = obj
+    _store_bucket_object(bucket, key, obj)
     _apply_object_lock_from_headers(bucket_name, key, synth)
 
     # Defer tag write until version_id is assigned (tags are per-version).
@@ -4517,7 +4568,7 @@ def serve_cloudfront_origin_fetch(bucket_name: str, key: str, method: str, heade
 
 def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     """Remove the current object plus its key-level metadata and on-disk copy."""
-    bucket["objects"].pop(key, None)
+    _remove_bucket_object(bucket, key)
     _object_tags.pop((bucket_name, key, None), None)
     _object_annotations.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
@@ -4633,7 +4684,7 @@ def _maybe_replicate(bucket_name: str, key: str, obj: dict, data) -> None:
     if rule.get("Destination", {}).get("StorageClass"):
         replica["storage_class"] = rule["Destination"]["StorageClass"]
     prior = dest_bucket["objects"].get(key)
-    dest_bucket["objects"][key] = replica
+    _store_bucket_object(dest_bucket, key, replica)
     replica_version = _record_object_version(dest_name, key, prior, replica, data)
     # The write paths store the source's tags after the version is cut; the
     # pointer lets them mirror the tags onto the replica, as AWS replicates
@@ -4790,11 +4841,11 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
     # Reconcile the current-object pointer (used by Head/GetObject without a
     # VersionId): a delete marker hides the object; a real version exposes it.
     if latest.get("is_delete_marker"):
-        bucket["objects"].pop(key, None)
+        _remove_bucket_object(bucket, key)
     else:
         record = _object_record_from_version(latest)
         record["body"] = _version_body(bucket, bucket_name, key, latest)
-        bucket["objects"][key] = record
+        _store_bucket_object(bucket, key, record)
     # The key now resolves to a different version (or to a marker): align the
     # sidecar so a restart does not restore the pre-delete view.
     _persist_version_state(bucket_name, key, bucket)
@@ -4870,7 +4921,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         # Add a delete marker instead of removing version history
         delete_marker_id = _record_delete_marker(bucket_name, key, bucket["objects"].get(key))
         existed = key in bucket["objects"]
-        bucket["objects"].pop(key, None)
+        _remove_bucket_object(bucket, key)
         if existed:
             _fire_s3_event_async(
                 bucket_name,
@@ -4882,7 +4933,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": delete_marker_id}, b""
 
     existed = key in bucket["objects"]
-    bucket["objects"].pop(key, None)
+    _remove_bucket_object(bucket, key)
     _object_tags.pop((bucket_name, key, None), None)
     _object_annotations.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
@@ -5147,7 +5198,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         "checksums": dest_checksums,
     }
     dest_prior_obj = dest_bucket["objects"].get(dest_key)
-    dest_bucket["objects"][dest_key] = dest_obj
+    _store_bucket_object(dest_bucket, dest_key, dest_obj)
 
     # --- Resolve tag payload now; commit after dest version_id is assigned
     #     (object tags are per-version per AWS).
@@ -6327,7 +6378,14 @@ def _delete_bucket_replication(bucket_name: str):
 # ---------------------------------------------------------------------------
 
 
-def _collect_list_entries(bucket_objects: dict, prefix: str, delimiter: str, max_keys: int, start_after: str):
+def _collect_list_entries(
+    bucket_objects: dict,
+    prefix: str,
+    delimiter: str,
+    max_keys: int,
+    start_after: str,
+    sorted_keys: list[str] | None = None,
+):
     """Collect contents and common prefixes with pagination as an ordered list of
     "rows": a delimiter-collapsed key becomes a single common-prefix row (value =
     the prefix), any other key is its own contents row (value = the key). Rows are
@@ -6341,36 +6399,95 @@ def _collect_list_entries(bucket_objects: dict, prefix: str, delimiter: str, max
     """
     rows: list[tuple[str, bool]] = []  # (value, is_common_prefix)
     seen_prefixes: set[str] = set()
-    for k in sorted(k for k in bucket_objects if k.startswith(prefix)):
+    sorted_keys = sorted_keys if sorted_keys is not None else sorted(bucket_objects)
+    start = bisect.bisect_left(sorted_keys, prefix)
+    if start_after:
+        start = max(start, bisect.bisect_right(sorted_keys, start_after))
+    index = start
+    is_truncated = False
+    while index < len(sorted_keys):
+        k = sorted_keys[index]
+        if not k.startswith(prefix):
+            break
+        is_common_prefix = False
+        value = k
         if delimiter:
             suffix = k[len(prefix) :]
             delim_idx = suffix.find(delimiter)
             if delim_idx >= 0:
-                cp = prefix + suffix[: delim_idx + len(delimiter)]
-                if cp not in seen_prefixes:
-                    seen_prefixes.add(cp)
-                    rows.append((cp, True))
-                continue
-        rows.append((k, False))
-
-    if start_after:
-        rows = [row for row in rows if row[0] > start_after]
+                value = prefix + suffix[: delim_idx + len(delimiter)]
+                is_common_prefix = True
+        if (not start_after or value > start_after) and (
+                not is_common_prefix or value not in seen_prefixes):
+            rows.append((value, is_common_prefix))
+            if is_common_prefix:
+                seen_prefixes.add(value)
+            if len(rows) > max_keys:
+                rows.pop()
+                is_truncated = True
+                break
+        if is_common_prefix:
+            upper_bound = _string_prefix_successor(value)
+            index = (len(sorted_keys) if upper_bound is None else
+                     bisect.bisect_left(sorted_keys, upper_bound, index + 1))
+        else:
+            index += 1
 
     contents: list[str] = []
     common_prefixes: list[str] = []
-    is_truncated = False
-    next_marker = ""
-    for i, (value, is_prefix) in enumerate(rows):
-        if i >= max_keys:
-            is_truncated = True
-            break
+    for value, is_prefix in rows:
         if is_prefix:
             common_prefixes.append(value)
         else:
             contents.append(value)
-        next_marker = value
+    next_marker = rows[-1][0] if rows else ""
 
     return contents, common_prefixes, is_truncated, next_marker
+
+
+def _string_prefix_successor(prefix: str) -> str | None:
+    for index in range(len(prefix) - 1, -1, -1):
+        codepoint = ord(prefix[index])
+        if codepoint < 0x10FFFF:
+            return prefix[:index] + chr(codepoint + 1)
+    return None
+
+
+def _parse_list_max_keys(query_params: dict):
+    raw = _qp(query_params, "max-keys", "1000")
+    try:
+        max_keys = int(raw)
+    except (TypeError, ValueError):
+        return None, _error("InvalidArgument", "Invalid max-keys value", 400)
+    if max_keys < 0:
+        return None, _error("InvalidArgument", "max-keys must be non-negative", 400)
+    return min(max_keys, 1000), None
+
+
+def _ensure_sorted_object_keys(bucket: dict) -> list[str]:
+    objects = bucket.setdefault("objects", {})
+    keys = bucket.get("_keys")
+    if not isinstance(keys, list) or len(keys) != len(objects):
+        keys = sorted(objects)
+        bucket["_keys"] = keys
+    return keys
+
+
+def _store_bucket_object(bucket: dict, key: str, obj: dict) -> None:
+    keys = _ensure_sorted_object_keys(bucket)
+    if key not in bucket["objects"]:
+        bisect.insort(keys, key)
+    bucket["objects"][key] = obj
+
+
+def _remove_bucket_object(bucket: dict, key: str):
+    keys = _ensure_sorted_object_keys(bucket)
+    old = bucket["objects"].pop(key, None)
+    if old is not None:
+        position = bisect.bisect_left(keys, key)
+        if position < len(keys) and keys[position] == key:
+            keys.pop(position)
+    return old
 
 
 def _list_objects_v1(bucket_name: str, query_params: dict):
@@ -6380,7 +6497,9 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
 
     prefix = _qp(query_params, "prefix", "")
     delimiter = _qp(query_params, "delimiter", "")
-    max_keys = int(_qp(query_params, "max-keys", "1000"))
+    max_keys, max_keys_err = _parse_list_max_keys(query_params)
+    if max_keys_err:
+        return max_keys_err
     marker = _qp(query_params, "marker", "")
     encoding_type = _qp(query_params, "encoding-type", "")
     encode = encoding_type == "url"
@@ -6391,6 +6510,7 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
         delimiter,
         max_keys,
         marker,
+        sorted_keys=_ensure_sorted_object_keys(bucket),
     )
 
     root = Element("ListBucketResult", xmlns=S3_NS)
@@ -6434,7 +6554,9 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
 
     prefix = _qp(query_params, "prefix", "")
     delimiter = _qp(query_params, "delimiter", "")
-    max_keys = int(_qp(query_params, "max-keys", "1000"))
+    max_keys, max_keys_err = _parse_list_max_keys(query_params)
+    if max_keys_err:
+        return max_keys_err
     continuation = _qp(query_params, "continuation-token", "")
     start_after = _qp(query_params, "start-after", "")
     fetch_owner = _qp(query_params, "fetch-owner", "").lower() == "true"
@@ -6455,6 +6577,7 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
         delimiter,
         max_keys,
         effective_start,
+        sorted_keys=_ensure_sorted_object_keys(bucket),
     )
 
     root = Element("ListBucketResult", xmlns=S3_NS)
@@ -6508,10 +6631,27 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
+    checksum_headers = any(headers.get(f"x-amz-checksum-{algorithm}")
+                           for algorithm in _S3_CHECKSUM_HEADERS)
+    checksum_algorithm = headers.get("x-amz-sdk-checksum-algorithm")
+    if not headers.get("content-md5") and not checksum_headers and not checksum_algorithm:
+        return _error("InvalidRequest", "Content-MD5 or a checksum header is required", 400)
+    md5_err = _validate_content_md5(headers, body)
+    if md5_err:
+        return md5_err
+    if checksum_headers or checksum_algorithm:
+        _checksums, checksum_err = _resolve_object_checksums(body, headers)
+        if checksum_err:
+            return checksum_err
+
     try:
         xml_root = fromstring(body)
     except Exception:
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+
+    object_elements = list(xml_root.findall("{%s}Object" % S3_NS)) or list(xml_root.findall("Object"))
+    if len(object_elements) > 1000:
+        return _error("MalformedXML", "The number of objects in the request must not exceed 1000", 400)
 
     quiet = False
     quiet_el = _find_xml_tag(xml_root, "Quiet")
@@ -6520,7 +6660,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
 
     deleted: list[dict] = []
     errors: list[dict] = []
-    for obj_el in list(xml_root.findall("{%s}Object" % S3_NS)) or list(xml_root.findall("Object")):
+    for obj_el in object_elements:
         key_el = _find_xml_tag(obj_el, "Key")
         if key_el is None or not key_el.text:
             continue
@@ -6604,7 +6744,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             # DELETE does, and report it on the Deleted entry.
             existed = k in bucket["objects"]
             marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
-            bucket["objects"].pop(k, None)
+            _remove_bucket_object(bucket, k)
             deleted.append({"key": k, "version_id": "", "was_marker": False, "marker_created": marker_id})
             if existed:
                 _fire_s3_event_async(
@@ -6619,7 +6759,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             existed = k in bucket["objects"]
             if existed:
                 _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete")
-            bucket["objects"].pop(k, None)
+            _remove_bucket_object(bucket, k)
             _object_tags.pop((bucket_name, k, None), None)
             _object_annotations.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
@@ -7040,7 +7180,7 @@ def _complete_multipart_upload(
         "checksum_type": "COMPOSITE" if composite else None,
     }
     prior_obj = bucket["objects"].get(key)
-    bucket["objects"][key] = obj
+    _store_bucket_object(bucket, key, obj)
 
     del _multipart_uploads[upload_id]
 
@@ -7589,7 +7729,7 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                     data = f.read()
                 size = len(data)
                 etag = etag or f'"{md5_hash(data)}"'
-            bucket["objects"][key] = {
+            _store_bucket_object(bucket, key, {
                 "body": None,
                 "content_type": meta.get("content_type", "application/octet-stream"),
                 "content_encoding": meta.get("content_encoding"),
@@ -7600,7 +7740,7 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                 "preserved_headers": meta.get("preserved_headers", {}),
                 "storage_class": meta.get("storage_class", "STANDARD"),
                 "checksums": meta.get("checksums", {}),
-            }
+            })
             if meta.get("version_id"):
                 bucket["objects"][key]["version_id"] = meta["version_id"]
             if "versions" in meta or "tags" in meta or "acl" in meta:
@@ -7648,7 +7788,7 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
 
 def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):
     """Rebuild a persisted delete marker and hide the key."""
-    bucket["objects"].pop(key, None)
+    _remove_bucket_object(bucket, key)
     if "versions" in meta:
         _load_persisted_history(account_id, bucket, bucket_name, key, meta)
         return
