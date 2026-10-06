@@ -1990,21 +1990,14 @@ def _seed_internal_topic(_sns, name, *, attributes=None, subscriptions=()):
     _sns._topics[arn] = {
         "name": name,
         "arn": arn,
-        "messages": [],
         "subscriptions": list(subscriptions),
         "attributes": attributes or {},
     }
     return arn
 
 
-def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monkeypatch):
-    """A publish through the seam gets everything an HTTP one gets.
-
-    The message_structure and message_attributes here are the two fields the
-    hand-rolled `topic["messages"].append(...)` this replaced used to drop, and
-    both are load-bearing: the first picks the per-protocol body, the second is
-    what a subscription filter policy reads.
-    """
+def test_sns_publish_internal_fans_out_without_storing_message(sns_internal, monkeypatch):
+    """Publish metadata is returned and delivered without retaining the body."""
     delivered = []
     monkeypatch.setattr(
         sns_internal,
@@ -2036,14 +2029,33 @@ def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monke
     assert result["sequence_number"] is None
     assert result["message_id"]
 
-    stored = sns_internal._topics[arn]["messages"]
-    assert len(stored) == 1
-    assert stored[0]["id"] == result["message_id"]
-    assert stored[0]["subject"] == "a subject"
-    assert stored[0]["message_structure"] == "json"
-    assert stored[0]["message_attributes"] == attrs
+    assert "messages" not in sns_internal._topics[arn]
     # message_structure picked the sqs body rather than the default one.
     assert delivered == ["for-sqs"]
+
+
+def test_sns_state_discards_legacy_topic_messages(sns_internal):
+    arn = _seed_internal_topic(sns_internal, f"legacy-{_uuid_mod.uuid4().hex[:8]}")
+    legacy_message = {"id": "old-id", "message": "old payload"}
+
+    sns_internal.load_persisted_state({
+        "topics": {
+            arn: {
+                "name": "legacy",
+                "arn": arn,
+                "attributes": {},
+                "subscriptions": [],
+                "messages": [legacy_message],
+                "tags": {},
+            },
+        },
+    })
+
+    assert "messages" not in sns_internal._topics[arn]
+
+    # Even an in-memory legacy topic must not copy its payload into a snapshot.
+    sns_internal._topics[arn]["messages"] = [legacy_message]
+    assert "messages" not in sns_internal.get_state()["topics"][arn]
 
 
 def test_sns_publish_internal_applies_the_subscription_filter_policy(
@@ -2081,6 +2093,215 @@ def test_sns_publish_internal_applies_the_subscription_filter_policy(
     )
 
     assert delivered == ["queue-match"]
+
+
+@pytest.mark.parametrize(
+    ("policy_value", "message_value", "expected"),
+    [
+        ({"suffix": ".json"}, "report.json", True),
+        ({"suffix": ".json"}, "report.csv", False),
+        ({"equals-ignore-case": "ready"}, "READY", True),
+        ({"equals-ignore-case": "ready"}, "not-ready", False),
+    ],
+)
+def test_sns_filter_policy_string_operators(
+    sns_internal, policy_value, message_value, expected
+):
+    sub = {
+        "attributes": {"FilterPolicy": json.dumps({"state": [policy_value]})},
+    }
+    attributes = {"state": {"DataType": "String", "StringValue": message_value}}
+
+    assert sns_internal._matches_filter_policy(sub, attributes) is expected
+
+
+@pytest.mark.parametrize(
+    ("policy_value", "message_value", "expected"),
+    [
+        ({"cidr": "10.0.0.0/8"}, "10.5.4.3", True),
+        ({"cidr": "10.0.0.0/8"}, "192.168.1.1", False),
+        ({"cidr": "2001:db8::/32"}, "2001:db8::42", True),
+        ({"wildcard": "report-*.json"}, "report-final.json", True),
+        ({"wildcard": "report-*.json"}, "report-final.csv", False),
+        ({"anything-but": {"prefix": "internal-"}}, "public-event", True),
+        ({"anything-but": {"prefix": "internal-"}}, "internal-event", False),
+        ({"anything-but": {"suffix": ".tmp"}}, "report.json", True),
+        ({"anything-but": {"suffix": ".tmp"}}, "report.tmp", False),
+    ],
+)
+def test_sns_filter_policy_additional_string_operators(
+    sns_internal, policy_value, message_value, expected
+):
+    sub = {
+        "attributes": {"FilterPolicy": json.dumps({"value": [policy_value]})},
+    }
+    attributes = {"value": {"DataType": "String", "StringValue": message_value}}
+
+    assert sns_internal._matches_filter_policy(sub, attributes) is expected
+
+
+def test_sns_filter_policy_cache_reuses_and_invalidates_parsed_policy(sns_internal):
+    sub = {"attributes": {"FilterPolicy": json.dumps({"state": ["ready"]})}}
+    ready = {"state": {"DataType": "String", "StringValue": "ready"}}
+    done = {"state": {"DataType": "String", "StringValue": "done"}}
+
+    assert sns_internal._matches_filter_policy(sub, ready) is True
+    cached_policy = sub[sns_internal._FILTER_POLICY_CACHE_KEY]
+    assert sns_internal._matches_filter_policy(sub, ready) is True
+    assert sub[sns_internal._FILTER_POLICY_CACHE_KEY] is cached_policy
+
+    sub["attributes"]["FilterPolicy"] = json.dumps({"state": ["done"]})
+    assert sns_internal._matches_filter_policy(sub, ready) is False
+    assert sns_internal._matches_filter_policy(sub, done) is True
+    assert sub[sns_internal._FILTER_POLICY_CACHE_KEY] is not cached_policy
+
+
+@pytest.mark.parametrize(
+    ("policy", "attributes", "message_body", "expected"),
+    [
+        ({"priority": [{"anything-but": "high"}, {"exists": False}]}, {}, None, True),
+        ({"priority": [{"exists": False}]},
+         {"priority": {"DataType": "String", "StringValue": "low"}}, None, False),
+        ({"details": {"priority": [{"exists": False}]}}, {},
+         json.dumps({"details": {}}), True),
+        ({"details": {"priority": [{"exists": False}]}}, {},
+         json.dumps({"details": {"priority": "low"}}), False),
+    ],
+)
+def test_sns_filter_policy_exists_false_matches_missing_keys(
+    sns_internal, policy, attributes, message_body, expected
+):
+    sub = {"attributes": {"FilterPolicy": json.dumps(policy)}}
+    if message_body is None:
+        assert sns_internal._matches_filter_policy(sub, attributes) is expected
+    else:
+        sub["attributes"]["FilterPolicyScope"] = "MessageBody"
+        assert sns_internal._matches_filter_policy(sub, {}, message_body) is expected
+
+
+@pytest.mark.parametrize("message_body", ["not-json", "[]", "\"ready\""])
+def test_sns_message_body_filter_rejects_invalid_or_non_object_json(
+    sns_internal, message_body
+):
+    sub = {
+        "attributes": {
+            "FilterPolicy": json.dumps({"state": ["ready"]}),
+            "FilterPolicyScope": "MessageBody",
+        },
+    }
+
+    assert sns_internal._matches_filter_policy(sub, {}, message_body) is False
+
+
+@pytest.mark.parametrize(
+    ("policy", "message_body", "expected"),
+    [
+        ({"store": {"book": [{"suffix": ".json"}]}},
+         {"store": {"book": "report.json"}}, True),
+        ({"store": {"book": [{"suffix": ".json"}]}},
+         {"store": {"book": "report.csv"}}, False),
+        ({"$or": [{"store": {"state": ["ready"]}}, {"store": {"state": ["done"]}}]},
+         {"store": {"state": "done"}}, True),
+    ],
+)
+def test_sns_message_body_filter_matches_nested_json(
+    sns_internal, policy, message_body, expected
+):
+    sub = {
+        "attributes": {
+            "FilterPolicy": json.dumps(policy),
+            "FilterPolicyScope": "MessageBody",
+        },
+    }
+
+    assert sns_internal._matches_filter_policy(sub, {}, json.dumps(message_body)) is expected
+
+
+def test_sns_publish_internal_message_body_filter_preserves_delivery_formats(
+    sns_internal, monkeypatch
+):
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(
+            (endpoint, envelope, raw, message)
+        ),
+    )
+    subscriptions = [
+        {
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": "sqs",
+            "endpoint": endpoint,
+            "confirmed": True,
+            "attributes": {
+                "FilterPolicy": json.dumps({"state": [{"equals-ignore-case": expected_state}]}),
+                "FilterPolicyScope": "MessageBody",
+                "RawMessageDelivery": raw,
+            },
+        }
+        for endpoint, raw, expected_state in (
+            ("queue-raw", "true", "ready"),
+            ("queue-envelope", "false", "ready"),
+            ("queue-skip", "false", "stopped"),
+        )
+    ]
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}",
+        subscriptions=subscriptions,
+    )
+    body = json.dumps({"state": "READY"})
+
+    sns_internal.publish_internal(arn, body)
+
+    assert [endpoint for endpoint, *_ in delivered] == ["queue-raw", "queue-envelope"]
+    assert delivered[0][1] == body
+    assert delivered[0][2:] == (True, body)
+    assert json.loads(delivered[1][1])["Message"] == body
+    assert delivered[1][2:] == (False, body)
+
+
+def test_sns_message_body_filter_uses_protocol_specific_message_structure(
+    sns_internal, monkeypatch
+):
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(
+            (endpoint, message)
+        ),
+    )
+    subscriptions = [
+        {
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": protocol,
+            "endpoint": endpoint,
+            "confirmed": True,
+            "attributes": {
+                "FilterPolicy": json.dumps({"kind": [expected_kind]}),
+                "FilterPolicyScope": "MessageBody",
+            },
+        }
+        for protocol, endpoint, expected_kind in (
+            ("sqs", "queue-match", "sqs"),
+            ("sqs", "queue-skip", "http"),
+        )
+    ]
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}",
+        subscriptions=subscriptions,
+    )
+    message = json.dumps({
+        "default": json.dumps({"kind": "default"}),
+        "sqs": json.dumps({"kind": "sqs"}),
+    })
+
+    sns_internal.publish_internal(arn, message, message_structure="json")
+
+    assert delivered == [("queue-match", json.dumps({"kind": "sqs"}))]
 
 
 def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
@@ -2121,8 +2342,8 @@ def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     assert second["duplicate"] is True
     assert second["message_id"] == first["message_id"]
     assert second["sequence_number"] == first["sequence_number"]
-    # ...and neither the store nor the subscriber saw it twice.
-    assert len(sns_internal._topics[arn]["messages"]) == 1
+    # ...and the subscriber saw it once without retaining the topic payload.
+    assert "messages" not in sns_internal._topics[arn]
     assert delivered == ["once"]
 
     # A different dedup id inside the same group is a new message.
@@ -2131,7 +2352,8 @@ def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
     )
     assert third["duplicate"] is False
     assert third["sequence_number"] == "2".zfill(20)
-    assert len(sns_internal._topics[arn]["messages"]) == 2
+    assert "messages" not in sns_internal._topics[arn]
+    assert delivered == ["once", "twice"]
 
 
 def test_sns_publish_internal_rejections(sns_internal):

@@ -23,6 +23,7 @@ import asyncio
 import contextvars
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -274,12 +275,31 @@ def _sms_log_for(phone_number: str) -> list:
 
 def get_state():
     return {
-        "topics": copy.deepcopy(_topics),
+        "topics": _copy_topics_without_messages(),
         "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic),
         "sms_messages": copy.deepcopy(_sms_messages),
         "platform_applications": copy.deepcopy(_platform_applications),
         "platform_endpoints": copy.deepcopy(_platform_endpoints),
     }
+
+
+def _copy_topics_without_messages():
+    topics = AccountRegionScopedDict()
+    for scoped_key, topic in _topics.all_items():
+        account_id, region, arn = scoped_key
+        if isinstance(topic, dict):
+            topic = {
+                key: copy.deepcopy(value)
+                for key, value in topic.items()
+                if key != "messages"
+            }
+            for subscription in topic.get("subscriptions", []):
+                subscription.pop(_FILTER_POLICY_CACHE_KEY, None)
+                subscription.pop(_FILTER_POLICY_SOURCE_KEY, None)
+        else:
+            topic = copy.deepcopy(topic)
+        topics.set_scoped(account_id, region, arn, topic)
+    return topics
 
 
 def load_persisted_state(data):
@@ -289,6 +309,9 @@ def load_persisted_state(data):
 def _restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
+        for topic in _topics.all_values():
+            if isinstance(topic, dict):
+                topic.pop("messages", None)
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
         _sms_messages.update(data.get("sms_messages", {}))
         _platform_applications.update(data.get("platform_applications", {}))
@@ -420,7 +443,6 @@ def _create_topic(params):
                 }),
             },
             "subscriptions": [],
-            "messages": [],
             "tags": {},
         }
 
@@ -610,8 +632,43 @@ def _subscribe(params):
     if endpoint_error:
         return endpoint_error
 
+    requested_attrs = {}
+    allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
+                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
+    i = 1
+    while _p(params, f"Attributes.entry.{i}.key"):
+        key = _p(params, f"Attributes.entry.{i}.key")
+        val = _p(params, f"Attributes.entry.{i}.value")
+        if key in allowed_attrs:
+            if key == "FilterPolicy":
+                try:
+                    parsed_policy = json.loads(val or "")
+                except (TypeError, ValueError):
+                    return _error("InvalidParameterException", "Invalid FilterPolicy", 400)
+                if not isinstance(parsed_policy, dict):
+                    return _error("InvalidParameterException", "Invalid FilterPolicy", 400)
+            requested_attrs[key] = val or ""
+        i += 1
+
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
+            current = existing.get("attributes", {})
+            comparable = ("RawMessageDelivery", "FilterPolicy", "FilterPolicyScope")
+            for key in comparable:
+                requested = requested_attrs.get(key, "false" if key == "RawMessageDelivery"
+                                                else "MessageAttributes" if key == "FilterPolicyScope" else "")
+                actual = current.get(key, "false" if key == "RawMessageDelivery"
+                                      else "MessageAttributes" if key == "FilterPolicyScope" else "")
+                if key == "FilterPolicy" and requested and actual:
+                    try:
+                        if json.loads(requested) != json.loads(actual):
+                            return _error("InvalidParameterException",
+                                          "Subscription already exists with different attributes", 400)
+                    except (TypeError, ValueError):
+                        return _error("InvalidParameterException", "Invalid FilterPolicy", 400)
+                elif requested.lower() != actual.lower():
+                    return _error("InvalidParameterException",
+                                  "Subscription already exists with different attributes", 400)
             return _xml(200, "SubscribeResponse",
                         f"<SubscribeResult><SubscriptionArn>{existing['arn']}</SubscriptionArn></SubscribeResult>")
 
@@ -638,15 +695,8 @@ def _subscribe(params):
         },
     }
 
-    allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
-    i = 1
-    while _p(params, f"Attributes.entry.{i}.key"):
-        key = _p(params, f"Attributes.entry.{i}.key")
-        val = _p(params, f"Attributes.entry.{i}.value")
-        if key in allowed_attrs:
-            sub["attributes"][key] = val or ""
-        i += 1
+    sub["attributes"].update(requested_attrs)
+    _cache_filter_policy(sub)
 
     topic["subscriptions"].append(sub)
     _sub_arn_to_topic[sub_arn] = topic_arn
@@ -790,11 +840,15 @@ def _set_subscription_attributes(params):
 
     if attr_name == "FilterPolicy" and attr_val:
         try:
-            json.loads(attr_val)
+            parsed_policy = json.loads(attr_val)
         except json.JSONDecodeError:
             return _error("InvalidParameterException", "Invalid JSON in FilterPolicy", 400)
+        if not isinstance(parsed_policy, dict):
+            return _error("InvalidParameterException", "FilterPolicy must be a JSON object", 400)
 
     sub["attributes"][attr_name] = attr_val
+    if attr_name == "FilterPolicy":
+        _cache_filter_policy(sub)
     return _xml(200, "SetSubscriptionAttributesResponse", "")
 
 
@@ -942,14 +996,6 @@ def publish_internal(
     else:
         msg_id = new_uuid()
 
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": message_structure,
-        "message_attributes": msg_attrs,
-        "timestamp": int(time.time()),
-    })
     _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
             message_group_id=message_group_id, message_dedup_id=dedup_id)
     logger.info(
@@ -1127,15 +1173,6 @@ def _publish_batch(params):
                     "sequence_number": seq_number,
                 }
 
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
-
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
                     message_group_id=group_id, message_dedup_id=dedup_id)
 
@@ -1149,14 +1186,6 @@ def _publish_batch(params):
         else:
             # ── Standard (non-FIFO) batch entry ──
             msg_id = new_uuid()
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
 
             successful += (
@@ -1189,19 +1218,35 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
     except ArnParseError:
         _owner, _region = get_account_id(), get_region()
 
+    parsed_message_bodies = {}
     for sub in topic["subscriptions"]:
         if not sub.get("confirmed"):
             continue
 
         protocol = sub.get("protocol", "")
         endpoint = sub.get("endpoint", "")
-
-        if not _matches_filter_policy(sub, message_attributes or {}):
-            continue
-
+        sub_attributes = sub.get("attributes", {})
         effective_message = _resolve_message_for_protocol(
             message, message_structure, protocol
         )
+        parsed_message_body = _FILTER_BODY_UNPARSED
+        if (sub_attributes.get("FilterPolicyScope") == "MessageBody"
+                and sub_attributes.get("FilterPolicy")):
+            parsed_message_body = parsed_message_bodies.get(
+                protocol, _FILTER_BODY_UNPARSED
+            )
+            if parsed_message_body is _FILTER_BODY_UNPARSED:
+                try:
+                    parsed_message_body = json.loads(effective_message)
+                    if not isinstance(parsed_message_body, dict):
+                        parsed_message_body = None
+                except (json.JSONDecodeError, TypeError):
+                    parsed_message_body = None
+                parsed_message_bodies[protocol] = parsed_message_body
+
+        if not _matches_filter_policy(
+                sub, message_attributes or {}, effective_message, parsed_message_body):
+            continue
 
         raw = sub.get("attributes", {}).get("RawMessageDelivery", "false") == "true"
         envelope = _build_envelope(
@@ -1276,28 +1321,8 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
 
     body = raw_message if raw else envelope
     sqs_attrs = dict(message_attributes) if raw and message_attributes else {}
-    now = time.time()
-    msg = {
-        "id": new_uuid(),
-        "body": body,
-        "md5": hashlib.md5(body.encode()).hexdigest(),
-        "message_attributes": sqs_attrs,
-        # Real SQS emits MD5OfMessageAttributes alongside MD5OfBody on
-        # ReceiveMessage; the field reads from msg["md5_attrs"]. Without
-        # this, raw SNS→SQS deliveries diverge from real AWS for
-        # consumers that verify the attribute MD5 (Java/Go SDKs do).
-        "md5_attrs": _sqs._md5_msg_attrs(sqs_attrs),
-        "receipt_handle": None,
-        "sent_at": now,
-        "visible_at": now,
-        "receive_count": 0,
-    }
-    if message_group_id:
-        msg["group_id"] = message_group_id
-    if message_dedup_id:
-        msg["dedup_id"] = message_dedup_id
-    _sqs._ensure_msg_fields(msg)
-    queue["messages"].append(msg)
+    _sqs.enqueue_internal(queue, body, sqs_attrs, message_group_id or None,
+                          message_dedup_id or None)
     logger.info("SNS fanout → SQS %s", queue_name)
 
 
@@ -1823,28 +1848,51 @@ def _resolve_message_for_protocol(message: str, message_structure: str,
     return parsed.get(protocol, parsed.get("default", message))
 
 
-def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
+_FILTER_BODY_UNPARSED = object()
+_FILTER_POLICY_CACHE_KEY = "_filter_policy_cache"
+_FILTER_POLICY_SOURCE_KEY = "_filter_policy_source"
+
+
+def _cache_filter_policy(sub: dict) -> None:
+    policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
+    try:
+        policy = json.loads(policy_json) if policy_json else {}
+    except (json.JSONDecodeError, TypeError):
+        policy = None
+    sub[_FILTER_POLICY_CACHE_KEY] = policy if isinstance(policy, dict) else None
+    sub[_FILTER_POLICY_SOURCE_KEY] = policy_json
+
+
+def _matches_filter_policy(sub: dict, message_attributes: dict,
+                           message_body: str = "",
+                           parsed_message_body=_FILTER_BODY_UNPARSED) -> bool:
     policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
     if not policy_json:
         return True
-    try:
-        policy = json.loads(policy_json)
-    except (json.JSONDecodeError, TypeError):
-        return True
+    if sub.get(_FILTER_POLICY_SOURCE_KEY) != policy_json:
+        _cache_filter_policy(sub)
+    policy = sub.get(_FILTER_POLICY_CACHE_KEY)
     if not isinstance(policy, dict):
         return True
 
     scope = sub.get("attributes", {}).get("FilterPolicyScope", "MessageAttributes")
 
     if scope == "MessageBody":
-        return True
+        if parsed_message_body is _FILTER_BODY_UNPARSED:
+            try:
+                parsed_message_body = json.loads(message_body)
+            except (json.JSONDecodeError, TypeError):
+                return False
+        if not isinstance(parsed_message_body, dict):
+            return False
+        return _body_policy_matches(policy, parsed_message_body)
 
     return _policy_matches(policy, message_attributes)
 
 
 _OR_RESERVED_MEMBER_KEYS = frozenset({
     "anything-but", "prefix", "suffix", "equals-ignore-case",
-    "numeric", "exists", "cidr",
+    "numeric", "exists", "cidr", "wildcard",
 })
 
 
@@ -1873,17 +1921,57 @@ def _policy_matches(policy: dict, message_attributes: dict) -> bool:
                        for member in allowed_values):
                 return False
             continue
-        attr = message_attributes.get(key)
-        if attr is None:
-            return False
         if not isinstance(allowed_values, list):
             allowed_values = [allowed_values]
+        attr = message_attributes.get(key)
+        if attr is None:
+            if _has_exists_false(allowed_values):
+                continue
+            return False
         # A String.Array attribute carries a JSON array of values; AWS evaluates
         # each element separately and the attribute matches if any element does.
         candidates = _attr_candidate_values(attr)
         if not any(_attr_matches_any(value, allowed_values) for value in candidates):
             return False
     return True
+
+
+def _body_policy_matches(policy: dict, body: dict) -> bool:
+    for key, allowed_values in policy.items():
+        if key == "$or" and _is_or_operator(allowed_values):
+            if not any(_body_policy_matches(member, body) for member in allowed_values):
+                return False
+            continue
+        if key not in body:
+            if _has_exists_false(allowed_values):
+                continue
+            return False
+        value = body[key]
+        if isinstance(allowed_values, dict):
+            if not isinstance(value, dict) or not _body_policy_matches(allowed_values, value):
+                return False
+            continue
+        if isinstance(value, dict):
+            return False
+        if not isinstance(allowed_values, list):
+            allowed_values = [allowed_values]
+        values = value if isinstance(value, list) else [value]
+        candidates = []
+        for candidate in values:
+            if isinstance(candidate, bool):
+                candidates.append("true" if candidate else "false")
+            elif isinstance(candidate, (str, int, float)):
+                candidates.append(str(candidate))
+        if not any(_attr_matches_any(candidate, allowed_values) for candidate in candidates):
+            return False
+    return True
+
+
+def _has_exists_false(rules) -> bool:
+    if not isinstance(rules, list):
+        rules = [rules]
+    return any(isinstance(rule, dict) and rule.get("exists") is False
+               for rule in rules)
 
 
 def _attr_candidate_values(attr: dict) -> list:
@@ -1929,10 +2017,29 @@ def _attr_matches_any(attr_value: str, rules: list) -> bool:
             if "prefix" in rule:
                 if attr_value.startswith(rule["prefix"]):
                     return True
+            if "suffix" in rule:
+                if attr_value.endswith(rule["suffix"]):
+                    return True
+            if "equals-ignore-case" in rule:
+                if attr_value.casefold() == rule["equals-ignore-case"].casefold():
+                    return True
+            if "cidr" in rule:
+                try:
+                    if ipaddress.ip_address(attr_value) in ipaddress.ip_network(
+                            rule["cidr"], strict=False):
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if "wildcard" in rule:
+                if _wildcard_matches(attr_value, rule["wildcard"]):
+                    return True
             if "anything-but" in rule:
                 excluded = rule["anything-but"]
                 if isinstance(excluded, list):
                     if attr_value not in excluded:
+                        return True
+                elif isinstance(excluded, dict):
+                    if not _attr_matches_any(attr_value, [excluded]):
                         return True
                 elif attr_value != str(excluded):
                     return True
@@ -1945,6 +2052,26 @@ def _attr_matches_any(attr_value: str, rules: list) -> bool:
                 except (ValueError, TypeError):
                     pass
     return False
+
+
+def _wildcard_matches(value, pattern) -> bool:
+    if not isinstance(pattern, str):
+        return False
+    parts = []
+    escaped = False
+    for char in pattern:
+        if escaped:
+            parts.append(_re.escape(char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "*":
+            parts.append(".*")
+        else:
+            parts.append(_re.escape(char))
+    if escaped:
+        parts.append(_re.escape("\\"))
+    return _re.fullmatch("".join(parts), value) is not None
 
 
 def _check_numeric(value: float, conditions: list) -> bool:

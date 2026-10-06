@@ -26,6 +26,38 @@ def _topic_arn(region, topic_name="PipeTopic"):
     return f"arn:aws:sns:{region}:000000000000:{topic_name}"
 
 
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_pipe_rejects_sns_fifo_target_without_mutating_state(monkeypatch, operation):
+    _pipes.reset()
+    monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
+    region_token = _request_region.set("us-east-1")
+    try:
+        name = "FifoTargetPipe"
+        if operation == "update":
+            _pipes.register_pipe(
+                name=name, source=_stream_arn("us-east-1"),
+                target=_topic_arn("us-east-1"),
+            )
+        body = {
+            "Source": _stream_arn("us-east-1"),
+            "Target": _topic_arn("us-east-1", "unsupported.fifo"),
+            "Description": "must not be saved",
+        }
+        handler = _pipes._create_pipe if operation == "create" else _pipes._update_pipe
+        status, _, response = handler(name, body)
+        assert status == 400
+        assert json.loads(response)["__type"] == "ValidationException"
+        if operation == "create":
+            assert name not in _pipes._pipes
+            assert not _pipes._positions.has_any()
+        else:
+            assert _pipes._pipes[name]["Target"] == _topic_arn("us-east-1")
+            assert _pipes._pipes[name]["Description"] == ""
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
+
+
 def test_register_pipe_rejects_cross_region_target(monkeypatch):
     _pipes.reset()
     monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
