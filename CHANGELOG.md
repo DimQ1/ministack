@@ -9,7 +9,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **Gateway**: reject malformed request-body and aws-chunked framing; preserve account-isolated SQS diagnostic aliases and tombstone-aware peeking.
+- **SQS**: validate message size including attributes and receive limits, return attribute checksums for the requested subset, and enforce retention. DLQ source ARNs are message system attributes, not queue attributes; FIFO transfers reset enqueue timestamps while Standard transfers preserve them. Diagnostic QueueUrl aliases preserve account isolation without depending on the current region.
+- **DynamoDB and Streams**: keep secondary indexes consistent on updates, bound transaction-idempotency caches, suppress stream events for unchanged items, and enforce evaluated-data pagination limits. Closed streams remain readable with continuation iterators until their records expire 24 hours after creation; GetRecords limits and iterator errors follow the documented API.
+- **S3**: maintain listing indexes across object mutations and persistence restoration, validate delete checksums and tags before mutation, and clear tags on untagged overwrites. Recreating an owned bucket returns BucketAlreadyOwnedByYou outside us-east-1; the us-east-1 retry resets its ACL.
+- **CloudWatch**: aggregate Values/Counts without expanding repeated samples and omit unavailable percentiles for negative values or non-reconstructible statistic sets.
+- **SES**: validate SendEmail addresses, required content fields and configuration sets, while accepting present empty content and requiring ASCII email addresses.
+- **Cross-service delivery**: route SQS producers through the shared enqueue path so delay, FIFO deduplication, retention and receiver wakeups are consistent; EventBridge and Pipes publish through the SNS delivery contract rather than retaining message history. Pipes rejects unsupported SNS FIFO targets before changing state.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 
