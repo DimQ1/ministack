@@ -9,7 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **DynamoDB Streams**: preserve closed-stream continuation until the terminal page, expire records by original age and enforce iterator and GetRecords limits; close streams through CloudFormation deletion.
+- **SNS**: cache filter policies without persisting caches, avoid retained message history and share scoped publish delivery with EventBridge and Pipes; reject unsupported Pipes SNS FIFO targets before mutation.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 

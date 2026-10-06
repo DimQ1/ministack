@@ -293,6 +293,9 @@ def _copy_topics_without_messages():
                 for key, value in topic.items()
                 if key != "messages"
             }
+            for subscription in topic.get("subscriptions", []):
+                subscription.pop(_FILTER_POLICY_CACHE_KEY, None)
+                subscription.pop(_FILTER_POLICY_SOURCE_KEY, None)
         else:
             topic = copy.deepcopy(topic)
         topics.set_scoped(account_id, region, arn, topic)
@@ -693,6 +696,7 @@ def _subscribe(params):
     }
 
     sub["attributes"].update(requested_attrs)
+    _cache_filter_policy(sub)
 
     topic["subscriptions"].append(sub)
     _sub_arn_to_topic[sub_arn] = topic_arn
@@ -836,11 +840,15 @@ def _set_subscription_attributes(params):
 
     if attr_name == "FilterPolicy" and attr_val:
         try:
-            json.loads(attr_val)
+            parsed_policy = json.loads(attr_val)
         except json.JSONDecodeError:
             return _error("InvalidParameterException", "Invalid JSON in FilterPolicy", 400)
+        if not isinstance(parsed_policy, dict):
+            return _error("InvalidParameterException", "FilterPolicy must be a JSON object", 400)
 
     sub["attributes"][attr_name] = attr_val
+    if attr_name == "FilterPolicy":
+        _cache_filter_policy(sub)
     return _xml(200, "SetSubscriptionAttributesResponse", "")
 
 
@@ -1841,6 +1849,18 @@ def _resolve_message_for_protocol(message: str, message_structure: str,
 
 
 _FILTER_BODY_UNPARSED = object()
+_FILTER_POLICY_CACHE_KEY = "_filter_policy_cache"
+_FILTER_POLICY_SOURCE_KEY = "_filter_policy_source"
+
+
+def _cache_filter_policy(sub: dict) -> None:
+    policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
+    try:
+        policy = json.loads(policy_json) if policy_json else {}
+    except (json.JSONDecodeError, TypeError):
+        policy = None
+    sub[_FILTER_POLICY_CACHE_KEY] = policy if isinstance(policy, dict) else None
+    sub[_FILTER_POLICY_SOURCE_KEY] = policy_json
 
 
 def _matches_filter_policy(sub: dict, message_attributes: dict,
@@ -1849,10 +1869,9 @@ def _matches_filter_policy(sub: dict, message_attributes: dict,
     policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
     if not policy_json:
         return True
-    try:
-        policy = json.loads(policy_json)
-    except (json.JSONDecodeError, TypeError):
-        return True
+    if sub.get(_FILTER_POLICY_SOURCE_KEY) != policy_json:
+        _cache_filter_policy(sub)
+    policy = sub.get(_FILTER_POLICY_CACHE_KEY)
     if not isinstance(policy, dict):
         return True
 
@@ -1902,11 +1921,13 @@ def _policy_matches(policy: dict, message_attributes: dict) -> bool:
                        for member in allowed_values):
                 return False
             continue
-        attr = message_attributes.get(key)
-        if attr is None:
-            return False
         if not isinstance(allowed_values, list):
             allowed_values = [allowed_values]
+        attr = message_attributes.get(key)
+        if attr is None:
+            if _has_exists_false(allowed_values):
+                continue
+            return False
         # A String.Array attribute carries a JSON array of values; AWS evaluates
         # each element separately and the attribute matches if any element does.
         candidates = _attr_candidate_values(attr)
@@ -1922,6 +1943,8 @@ def _body_policy_matches(policy: dict, body: dict) -> bool:
                 return False
             continue
         if key not in body:
+            if _has_exists_false(allowed_values):
+                continue
             return False
         value = body[key]
         if isinstance(allowed_values, dict):
@@ -1942,6 +1965,13 @@ def _body_policy_matches(policy: dict, body: dict) -> bool:
         if not any(_attr_matches_any(candidate, allowed_values) for candidate in candidates):
             return False
     return True
+
+
+def _has_exists_false(rules) -> bool:
+    if not isinstance(rules, list):
+        rules = [rules]
+    return any(isinstance(rule, dict) and rule.get("exists") is False
+               for rule in rules)
 
 
 def _attr_candidate_values(attr: dict) -> list:

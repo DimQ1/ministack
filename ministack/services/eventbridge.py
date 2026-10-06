@@ -2459,24 +2459,8 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
         return
 
     sqs_parameters = sqs_parameters or {}
-    msg_id = new_uuid()
-    md5 = hashlib.md5(payload.encode()).hexdigest()
-    now = time.time()
-    msg = {
-        "id": msg_id,
-        "body": payload,
-        "md5_body": md5,
-        "receipt_handle": None,
-        "sent_at": now,
-        "visible_at": now,
-        "receive_count": 0,
-        "attributes": {},
-        "message_attributes": {},
-        "sys": {
-            "SenderId": "AROAEXAMPLE",
-            "SentTimestamp": str(int(now * 1000)),
-        },
-    }
+    group_id = None
+    dedup_id = None
     if queue.get("is_fifo"):
         group_id = sqs_parameters.get("MessageGroupId") or ""
         if not group_id:
@@ -2486,36 +2470,32 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
                 queue_name,
             )
             group_id = "ministack-eventbridge-default"
-        msg["group_id"] = group_id
         # Mirror real EventBridge: derive a content-based dedup ID when none is
         # supplied so retries are idempotent within the FIFO dedup window.
-        msg["dedup_id"] = hashlib.sha256(payload.encode()).hexdigest()
-        # Maintain sequence numbering so subsequent ReceiveMessage calls see
-        # the same ordering as native SQS FIFO deliveries.
-        queue["fifo_seq"] = queue.get("fifo_seq", 0) + 1
-        msg["seq"] = str(queue["fifo_seq"]).zfill(20)
-    queue["messages"].append(msg)
-    if hasattr(_sqs, "_ensure_msg_fields"):
-        _sqs._ensure_msg_fields(queue["messages"][-1])
+        dedup_id = (sqs_parameters.get("MessageDeduplicationId")
+                    or hashlib.sha256(payload.encode()).hexdigest())
+    _sqs.enqueue_internal(queue, payload, {}, group_id, dedup_id)
     logger.info("EventBridge → SQS %s", queue_name)
 
 
 def _dispatch_to_sns(arn, payload):
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(arn)
-    if not topic:
+    topic = _sns._topic_by_arn_any_scope(arn)
+    if topic is None:
         logger.warning("EventBridge → SNS: topic %s not found", arn)
         return
-
-    msg_id = new_uuid()
-    topic["messages"].append({
-        "id": msg_id,
-        "message": payload,
-        "subject": "EventBridge Notification",
-        "timestamp": int(time.time()),
-    })
-    _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
+    publish_options = {}
+    if _sns._is_fifo_topic(topic):
+        publish_options = {
+            "message_group_id": "eventbridge-default",
+            "message_deduplication_id": hashlib.sha256(payload.encode()).hexdigest(),
+        }
+    try:
+        _sns.publish_internal(arn, payload, "EventBridge Notification", **publish_options)
+    except _sns.SnsPublishError as exc:
+        logger.warning("EventBridge → SNS %s rejected delivery: %s", arn, exc)
+        return
     logger.info("EventBridge → SNS %s", arn)
 
 

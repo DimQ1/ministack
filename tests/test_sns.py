@@ -2140,6 +2140,45 @@ def test_sns_filter_policy_additional_string_operators(
     assert sns_internal._matches_filter_policy(sub, attributes) is expected
 
 
+def test_sns_filter_policy_cache_reuses_and_invalidates_parsed_policy(sns_internal):
+    sub = {"attributes": {"FilterPolicy": json.dumps({"state": ["ready"]})}}
+    ready = {"state": {"DataType": "String", "StringValue": "ready"}}
+    done = {"state": {"DataType": "String", "StringValue": "done"}}
+
+    assert sns_internal._matches_filter_policy(sub, ready) is True
+    cached_policy = sub[sns_internal._FILTER_POLICY_CACHE_KEY]
+    assert sns_internal._matches_filter_policy(sub, ready) is True
+    assert sub[sns_internal._FILTER_POLICY_CACHE_KEY] is cached_policy
+
+    sub["attributes"]["FilterPolicy"] = json.dumps({"state": ["done"]})
+    assert sns_internal._matches_filter_policy(sub, ready) is False
+    assert sns_internal._matches_filter_policy(sub, done) is True
+    assert sub[sns_internal._FILTER_POLICY_CACHE_KEY] is not cached_policy
+
+
+@pytest.mark.parametrize(
+    ("policy", "attributes", "message_body", "expected"),
+    [
+        ({"priority": [{"anything-but": "high"}, {"exists": False}]}, {}, None, True),
+        ({"priority": [{"exists": False}]},
+         {"priority": {"DataType": "String", "StringValue": "low"}}, None, False),
+        ({"details": {"priority": [{"exists": False}]}}, {},
+         json.dumps({"details": {}}), True),
+        ({"details": {"priority": [{"exists": False}]}}, {},
+         json.dumps({"details": {"priority": "low"}}), False),
+    ],
+)
+def test_sns_filter_policy_exists_false_matches_missing_keys(
+    sns_internal, policy, attributes, message_body, expected
+):
+    sub = {"attributes": {"FilterPolicy": json.dumps(policy)}}
+    if message_body is None:
+        assert sns_internal._matches_filter_policy(sub, attributes) is expected
+    else:
+        sub["attributes"]["FilterPolicyScope"] = "MessageBody"
+        assert sns_internal._matches_filter_policy(sub, {}, message_body) is expected
+
+
 @pytest.mark.parametrize("message_body", ["not-json", "[]", "\"ready\""])
 def test_sns_message_body_filter_rejects_invalid_or_non_object_json(
     sns_internal, message_body

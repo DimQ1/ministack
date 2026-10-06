@@ -30,7 +30,6 @@ from ministack.core.responses import (
     _request_region,
     get_account_id,
     get_region,
-    new_uuid,
 )
 
 logger = logging.getLogger("pipes")
@@ -161,6 +160,7 @@ def register_pipe(
     pipe_region = get_region()
     # AWS rejects cross-region source/target ARNs before role validation.
     check_same_region(source, target)
+    check_supported_target(target)
 
     arn = f"arn:aws:pipes:{pipe_region}:{get_account_id()}:pipe/{name}"
     state = "STOPPED" if str(desired_state).upper() == "STOPPED" else "RUNNING"
@@ -297,24 +297,29 @@ def _start_state_machine_from_records(sm_arn: str, pipe: dict, records: list) ->
 def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(topic_arn)
+    topic = _sns._topic_by_arn_any_scope(topic_arn)
     if not topic:
         logger.warning("Pipes %s: SNS topic not found %s", pipe.get("Name"), topic_arn)
         return
 
-    msg_id = new_uuid()
     message = json.dumps(record)
     subject = f"Pipes {pipe.get('Name', '')}"
+    if _sns._is_fifo_topic(topic):
+        logger.warning("Pipes %s: SNS FIFO targets are not supported", pipe.get("Name"))
+        return
+    try:
+        _sns.publish_internal(topic_arn, message, subject)
+    except _sns.SnsPublishError as exc:
+        logger.warning("Pipes %s: SNS publish rejected: %s", pipe.get("Name"), exc)
 
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": "",
-        "message_attributes": {},
-        "timestamp": int(time.time()),
-    })
-    _sns._fanout(topic_arn, msg_id, message, subject, "", {})
+
+def check_supported_target(arn: str) -> None:
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return
+    if spec.service == "sns" and spec.resource.endswith(".fifo"):
+        raise ValueError("SNS FIFO topics are not supported as pipe targets.")
 
 
 def _arn_service(arn: str) -> str:
@@ -517,6 +522,11 @@ def _update_pipe(name, body):
     pipe = _pipes.get(name)
     if pipe is None:
         return _not_found(name)
+    if body.get("Target"):
+        try:
+            check_supported_target(body["Target"])
+        except ValueError as exc:
+            return _error(400, "ValidationException", str(exc))
     if "Description" in body:
         pipe["Description"] = body.get("Description", "") or ""
     if "RoleArn" in body:
