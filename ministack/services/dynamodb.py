@@ -18,9 +18,11 @@ Uses X-Amz-Target header for action routing (JSON API).
 
 import base64
 import binascii
+import bisect
 import copy
 import csv
 import gzip
+import hashlib
 import io
 import json
 import logging
@@ -121,7 +123,7 @@ def get_state():
     for (account_id, region, table_name), table in _tables.all_items():
         table_state = {
             key: value for key, value in table.items()
-            if key != "_secondary_indexes"
+            if key not in {"_secondary_indexes", "_scan_keys"}
         }
         tables.set_scoped(account_id, region, table_name, copy.deepcopy(table_state))
     return {
@@ -223,6 +225,7 @@ def _restore_state(data):
             if sse and "Status" not in sse and ("Enabled" in sse or "KMSMasterKeyId" in sse):
                 tbl["SSEDescription"] = _sse_description_from_spec(sse)
             tbl.pop("_secondary_indexes", None)
+            tbl.pop("_scan_keys", None)
             _update_counts(tbl)
             _rebuild_secondary_indexes(tbl)
         _tags.update(data.get("tags", {}))
@@ -571,6 +574,7 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
 _stream_records = AccountRegionScopedDict()
+_closed_streams = AccountRegionScopedDict()
 
 
 def _stream_label() -> str:
@@ -587,7 +591,19 @@ _stream_seq_lock = threading.Lock()
 
 # AWS DynamoDB Streams keeps records for 24 hours; retention is purely
 # time-based, so records are expired by age and by nothing else.
-_STREAM_RETENTION_SECONDS = 24 * 60 * 60
+def _stream_env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+_STREAM_RETENTION_SECONDS = _stream_env_int(
+    "MINISTACK_DDB_STREAM_RETENTION_SECONDS", 24 * 60 * 60, 1
+)
+_STREAM_MAX_RECORDS = _stream_env_int("MINISTACK_DDB_STREAM_MAX_RECORDS", 0, 0)
+_CLOSED_STREAM_RETENTION_SECONDS = 24 * 60 * 60
 
 
 def _record_age_cutoff(record: dict, cutoff: float) -> bool:
@@ -615,6 +631,8 @@ def _trim_stream_records(table_name: str, *, account_id=None, region=None) -> No
     expired = 0
     while expired < len(records) and _record_age_cutoff(records[expired], cutoff):
         expired += 1
+    if _STREAM_MAX_RECORDS:
+        expired = max(expired, len(records) - _STREAM_MAX_RECORDS)
     if not expired:
         return
     del records[:expired]
@@ -673,9 +691,53 @@ def stream_live_records(table_name: str, *, account_id=None, region=None) -> lis
     return _live_stream_records(table_name, account_id, region)
 
 
-def drop_stream_records(table_name: str) -> None:
-    _stream_records.pop(table_name, None)
-    _stream_trimmed.pop(table_name, None)
+def closed_stream_info(stream_arn: str, *, account_id: str, region: str) -> dict | None:
+    closed = _closed_streams.get_scoped(account_id, region, stream_arn)
+    if not closed:
+        return None
+    if closed.get("expires_at", 0) <= time.time():
+        _closed_streams.pop_scoped(account_id, region, stream_arn, None)
+        return None
+    records = closed["records"]
+    cutoff = time.time() - _STREAM_RETENTION_SECONDS
+    expired = 0
+    while expired < len(records) and _record_age_cutoff(records[expired], cutoff):
+        expired += 1
+    if expired:
+        del records[:expired]
+        closed["horizon"] += expired
+    return closed
+
+
+def drop_stream_records(
+    table_name: str,
+    *,
+    preserve_closed: bool = False,
+    table: dict | None = None,
+    account_id: str | None = None,
+    region: str | None = None,
+) -> None:
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    if preserve_closed and table:
+        stream_spec = table.get("StreamSpecification") or {}
+        stream_arn = table.get("LatestStreamArn")
+        if stream_spec.get("StreamEnabled") and stream_arn:
+            _trim_stream_records(table_name, account_id=account_id, region=region)
+            records = _live_stream_records(table_name, account_id, region)
+            _closed_streams.set_scoped(account_id, region, stream_arn, {
+                "TableName": table_name,
+                "StreamArn": stream_arn,
+                "StreamLabel": table.get("LatestStreamLabel", ""),
+                "StreamViewType": stream_spec.get("StreamViewType", "NEW_AND_OLD_IMAGES"),
+                "CreationDateTime": table.get("CreationDateTime", 0),
+                "KeySchema": copy.deepcopy(table.get("KeySchema", [])),
+                "records": copy.deepcopy(records),
+                "horizon": _trimmed_count(table_name, account_id, region),
+                "expires_at": time.time() + _CLOSED_STREAM_RETENTION_SECONDS,
+            })
+    _stream_records.pop_scoped(account_id, region, table_name, None)
+    _stream_trimmed.pop_scoped(account_id, region, table_name, None)
 
 
 def _next_stream_seq():
@@ -701,7 +763,9 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
             "SizeBytes": 0,
             "StreamViewType": view_type,
         },
-        "eventSourceARN": f"{table['TableArn']}/stream/{_stream_label()}",
+        "eventSourceARN": table.get(
+            "LatestStreamArn", f"{table['TableArn']}/stream/{_stream_label()}"
+        ),
     }
 
     ref_item = new_item or old_item or {}
@@ -1337,6 +1401,7 @@ def _delete_table(data):
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
     remaining = [r for r in _replica_group(_tables[name]) if r != get_region()]
+    drop_stream_records(name, preserve_closed=True, table=_tables[name])
     del _tables[name]
     if remaining:
         _set_replica_group(name, remaining)
@@ -1344,7 +1409,6 @@ def _delete_table(data):
     _ttl_settings.pop(name, None)
     _pitr_settings.pop(name, None)
     _kinesis_destinations.pop(name, None)
-    drop_stream_records(name)
     return json_response({"TableDescription": desc})
 
 
@@ -1356,15 +1420,21 @@ def _describe_table(data):
 
 
 def _list_tables(data):
-    limit = data.get("Limit", 100)
+    try:
+        limit = int(data.get("Limit", 100))
+    except (TypeError, ValueError):
+        return error_response_json("ValidationException", "Limit must be between 1 and 100", 400)
+    if limit < 1 or limit > 100:
+        return error_response_json("ValidationException", "Limit must be between 1 and 100", 400)
     start = data.get("ExclusiveStartTableName", "")
     names = sorted(_tables.keys())
     if start:
         names = [n for n in names if n > start]
-    names = names[:limit]
-    result = {"TableNames": names}
-    if len(names) == limit and names:
-        result["LastEvaluatedTableName"] = names[-1]
+    has_more = len(names) > limit
+    page = names[:limit]
+    result = {"TableNames": page}
+    if has_more and page:
+        result["LastEvaluatedTableName"] = page[-1]
     return json_response(result)
 
 
@@ -1436,11 +1506,14 @@ def _apply_replica_updates(name, table, updates):
                 return error_response_json("ValidationException",
                     "Replica specified in the Replica Update or Replica Delete action of the request was not found.", 400)
             if action == "Delete":
+                replica = _tables.get_scoped(account, region, name)
+                drop_stream_records(
+                    name, preserve_closed=True, table=replica,
+                    account_id=account, region=region,
+                )
                 _tables.pop_scoped(account, region, name, None)
                 _ttl_settings.pop_scoped(account, region, name, None)
                 _pitr_settings.pop_scoped(account, region, name, None)
-                with request_scope(account, region):
-                    drop_stream_records(name)
                 regions.discard(region)
     _set_replica_group(name, regions)
     if len(regions) <= 1:
@@ -1541,6 +1614,8 @@ def _update_table(data):
     if "StreamSpecification" in data:
         stream_spec = data["StreamSpecification"]
         stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
+        if stream_was_enabled and not stream_spec.get("StreamEnabled"):
+            drop_stream_records(name, preserve_closed=True, table=table)
         table["StreamSpecification"] = stream_spec
         if stream_spec.get("StreamEnabled") and not stream_was_enabled:
             stream_label = _stream_label()
@@ -1672,7 +1747,7 @@ def _table_description(name):
         desc["GlobalSecondaryIndexes"] = t["GlobalSecondaryIndexes"]
     if t.get("LocalSecondaryIndexes"):
         desc["LocalSecondaryIndexes"] = t["LocalSecondaryIndexes"]
-    if t.get("StreamSpecification"):
+    if (t.get("StreamSpecification") or {}).get("StreamEnabled"):
         desc["StreamSpecification"] = t["StreamSpecification"]
         desc["LatestStreamLabel"] = t.get("LatestStreamLabel", "")
         desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
@@ -2100,17 +2175,14 @@ def _update_item(data):
         if key_err:
             return key_err
     elif attribute_updates:
+        key_err = _key_attribute_update_error(table, set(attribute_updates.keys()))
+        if key_err:
+            return key_err
         try:
             item = _apply_attribute_updates(item, attribute_updates)
         except _AttributeUpdatesValidationError as exc:
             return error_response_json("ValidationException", str(exc), 400)
         updated_attrs = set(attribute_updates.keys())
-    # AWS rejects any update that would mutate a hash or range key value.
-    for key_name in (table.get("pk_name"), table.get("sk_name")):
-        if key_name and key_name in item and existing is not None:
-            if item.get(key_name) != existing.get(key_name):
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
 
     # AWS rejects updates with invalid values
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
@@ -2413,7 +2485,10 @@ def _query(data):
     scanned_count = len(candidates)
     query_filter = data.get("QueryFilter")
     if query_filter and not filter_expr:
-        filtered = [it for it in candidates if _evaluate_legacy_filter(it, query_filter)]
+        filtered = [
+            it for it in candidates
+            if _evaluate_legacy_filter(it, query_filter, data.get("ConditionalOperator", "AND"))
+        ]
     elif filter_expr:
         try:
             filtered = [it for it in candidates if _evaluate_condition(filter_expr, it, eav, ean, slot="FilterExpression")]
@@ -2569,12 +2644,11 @@ def _scan(data):
                 "Consistent reads are not supported on global secondary indexes", 400)
     # Query Limit also validated above for parity.
 
-    all_items = []
-    for pk in sorted(table["items"].keys()):
-        for sk in sorted(table["items"][pk].keys()):
-            all_items.append(table["items"][pk][sk])
-
     if index_name:
+        all_items = []
+        for pk in sorted(table["items"].keys()):
+            for sk in sorted(table["items"][pk].keys()):
+                all_items.append(table["items"][pk][sk])
         pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
         if is_gsi:
             err = _validate_gsi_read_projection(table, index_name, data)
@@ -2595,7 +2669,7 @@ def _scan(data):
     # Parallel scan: partition items deterministically across segments by
     # hashing the partition key. AWS guarantees segments return disjoint
     # subsets and their union equals the full table scan.
-    if segment is not None and total_segments is not None:
+    if index_name and segment is not None and total_segments is not None:
         import hashlib as _hl
         seg_n = int(segment); ts_n = int(total_segments)
         if index_name:
@@ -2608,6 +2682,7 @@ def _scan(data):
             return (int.from_bytes(h[:4], "big") % ts_n) == seg_n
         all_items = [it for it in all_items if _seg_match(it)]
 
+    scan_start = 0
     if esk:
         # ESK must contain the base-table key attributes (and the index's keys
         # when scanning an index). AWS LastEvaluatedKey always carries both sets;
@@ -2628,7 +2703,38 @@ def _scan(data):
                 all_items, esk, pk_name_idx, sk_name_idx, scan_forward=True, table=table
             )
         else:
-            all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
+            start_pk = _extract_key_val(esk.get(table["pk_name"], {}))
+            if table.get("sk_name"):
+                start_sk = _extract_key_val(esk.get(table["sk_name"], {}))
+            else:
+                start_sk = chr(0x10FFFF)
+            scan_start = bisect.bisect_right(
+                _ensure_scan_keys(table), (start_pk, start_sk)
+            )
+
+    if not index_name:
+        scan_keys = _ensure_scan_keys(table)
+
+        def _iter_table_scan_items():
+            if segment is not None and total_segments is not None:
+                import hashlib as _hl
+
+                segment_number = int(segment)
+                segment_count = int(total_segments)
+                partition_key_name = table.get("pk_name") or "pk"
+            for key_index in range(scan_start, len(scan_keys)):
+                pk_value, sk_value = scan_keys[key_index]
+                item = table["items"].get(pk_value, {}).get(sk_value)
+                if item is None:
+                    continue
+                if segment is not None and total_segments is not None:
+                    partition_value = _extract_key_val(item.get(partition_key_name, {}))
+                    digest = _hl.sha1(str(partition_value).encode("utf-8")).digest()
+                    if int.from_bytes(digest[:4], "big") % segment_count != segment_number:
+                        continue
+                yield item
+
+        all_items = _iter_table_scan_items()
 
     size_fn = None
     if index_name:
@@ -2646,7 +2752,10 @@ def _scan(data):
     # Legacy ScanFilter / QueryFilter support
     scan_filter = data.get("ScanFilter") or data.get("QueryFilter")
     if scan_filter and not filter_expr:
-        filtered = [it for it in all_items if _evaluate_legacy_filter(it, scan_filter)]
+        filtered = [
+            it for it in all_items
+            if _evaluate_legacy_filter(it, scan_filter, data.get("ConditionalOperator", "AND"))
+        ]
     elif filter_expr:
         try:
             filtered = [it for it in all_items if _evaluate_condition(filter_expr, it, eav, ean, slot="FilterExpression")]
@@ -3397,13 +3506,13 @@ def _execute_transaction(data):
 
     # ClientRequestToken idempotency parity with TransactWriteItems.
     crt = data.get("ClientRequestToken")
-    signature = None
+    signature_digest = None
     if crt:
         _prune_txn_idempotency()
         prior = _txn_idempotency.get(crt)
-        signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
+        signature_digest = _transaction_signature_digest(data)
         if prior is not None:
-            if prior.get("signature") == signature:
+            if prior.get("signature_digest") == signature_digest:
                 replay = {k: v for k, v in prior.get("response", {}).items() if k != "ConsumedCapacity"}
                 if data.get("ReturnConsumedCapacity", "NONE") != "NONE":
                     consumed = []
@@ -3524,8 +3633,9 @@ def _execute_transaction(data):
                              "WriteCapacityUnits": write_units})
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"created_at": time.time(), "signature": signature,
+        _txn_idempotency[crt] = {"created_at": time.time(), "signature_digest": signature_digest,
                                  "response": result, "sizes": txn_sizes}
+        _prune_txn_idempotency()
     return json_response(result)
 
 
@@ -4250,9 +4360,9 @@ def _transact_write_items(data):
         prior = _txn_idempotency.get(crt)
         # Drop the ClientRequestToken from the payload signature so equality
         # is on the actual transaction body.
-        signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
+        signature_digest = _transaction_signature_digest(data)
         if prior is not None:
-            if prior.get("signature") == signature:
+            if prior.get("signature_digest") == signature_digest:
                 # A same-token replay does not re-apply the writes; AWS reports
                 # a transactional READ of the stored result, recomputed against
                 # the item sizes (2 x ceil(size/4KB) per item) — measured
@@ -4477,12 +4587,33 @@ def _transact_write_items(data):
     if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"created_at": time.time(), "signature": signature,
+        _txn_idempotency[crt] = {"created_at": time.time(), "signature_digest": signature_digest,
                                  "response": result, "sizes": txn_sizes}
+        _prune_txn_idempotency()
     return json_response(result)
 
 
 _txn_idempotency = AccountRegionScopedDict()
+_TXN_IDEMPOTENCY_MAX_ENTRIES = 10_000
+
+
+def _transaction_signature_digest(data: dict) -> str:
+    payload = {key: value for key, value in data.items() if key != "ClientRequestToken"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _prune_txn_idempotency() -> None:
+    cutoff = time.time() - 600
+    for token, entry in list(_txn_idempotency.items()):
+        if entry.get("created_at", 0) <= cutoff:
+            _txn_idempotency.pop(token, None)
+    while len(_txn_idempotency) > _TXN_IDEMPOTENCY_MAX_ENTRIES:
+        oldest_token = min(
+            _txn_idempotency,
+            key=lambda token: _txn_idempotency[token].get("created_at", 0),
+        )
+        _txn_idempotency.pop(oldest_token, None)
 
 
 def _prune_txn_idempotency() -> None:
@@ -8013,6 +8144,11 @@ def _index_key_names(index):
 
 
 def _rebuild_secondary_indexes(table):
+    table["_scan_keys"] = sorted(
+        (base_pk, base_sk)
+        for base_pk, base_items in table["items"].items()
+        for base_sk in base_items
+    )
     indexes = {}
     for definition in (table.get("GlobalSecondaryIndexes", [])
                        + table.get("LocalSecondaryIndexes", [])):
@@ -8091,7 +8227,20 @@ def _remove_item_from_secondary_indexes(table, base_pk, base_sk, item, skip_name
         )
 
 
+def _ensure_scan_keys(table):
+    scan_keys = table.get("_scan_keys")
+    if not isinstance(scan_keys, list) or len(scan_keys) != table.get("ItemCount", 0):
+        scan_keys = sorted(
+            (base_pk, base_sk)
+            for base_pk, base_items in table["items"].items()
+            for base_sk in base_items
+        )
+        table["_scan_keys"] = scan_keys
+    return scan_keys
+
+
 def _set_item(table, pk_val, sk_val, item):
+    scan_keys = _ensure_scan_keys(table)
     old_item = table["items"].get(pk_val, {}).get(sk_val)
     unchanged_indexes = set()
     if old_item is not None:
@@ -8104,6 +8253,7 @@ def _set_item(table, pk_val, sk_val, item):
         )
     else:
         table["ItemCount"] = table.get("ItemCount", 0) + 1
+        bisect.insort(scan_keys, (pk_val, sk_val))
     table["items"][pk_val][sk_val] = item
     _add_item_to_secondary_indexes(table, pk_val, sk_val, item, unchanged_indexes)
     table["TableSizeBytes"] = table["ItemCount"] * 200
@@ -8111,9 +8261,13 @@ def _set_item(table, pk_val, sk_val, item):
 
 
 def _remove_item(table, pk_val, sk_val):
+    scan_keys = _ensure_scan_keys(table)
     old_item = table["items"].get(pk_val, {}).get(sk_val)
     if old_item is None:
         return None
+    key_position = bisect.bisect_left(scan_keys, (pk_val, sk_val))
+    if key_position < len(scan_keys) and scan_keys[key_position] == (pk_val, sk_val):
+        scan_keys.pop(key_position)
     _remove_item_from_secondary_indexes(table, pk_val, sk_val, old_item)
     del table["items"][pk_val][sk_val]
     if not table["items"][pk_val]:
@@ -8184,14 +8338,18 @@ def _check_legacy_comparison(item_val, op, attr_vals):
     return True
 
 
-def _evaluate_legacy_filter(item, scan_filter):
-    """Evaluate legacy ScanFilter/QueryFilter conditions (implicit AND)."""
+def _evaluate_legacy_filter(item, scan_filter, conditional_operator="AND"):
+    """Evaluate legacy ScanFilter/QueryFilter conditions."""
+    results = []
     for attr_name, condition in scan_filter.items():
         op = condition.get("ComparisonOperator", "")
         attr_vals = condition.get("AttributeValueList", [])
-        if not _check_legacy_comparison(item.get(attr_name), op, attr_vals):
-            return False
-    return True
+        results.append(_check_legacy_comparison(item.get(attr_name), op, attr_vals))
+    if not results:
+        return True
+    if conditional_operator == "OR":
+        return any(results)
+    return all(results)
 
 
 def _evaluate_expected(item, expected, conditional_operator="AND"):
@@ -8502,6 +8660,7 @@ def reset():
         _ttl_settings.clear()
         _pitr_settings.clear()
         _stream_records.clear()
+        _closed_streams.clear()
         _stream_trimmed.clear()
         _kinesis_destinations.clear()
         _backups.clear()
