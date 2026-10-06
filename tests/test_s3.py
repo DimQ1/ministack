@@ -16,6 +16,137 @@ from conftest import make_client, patch_endpoint_dns, sqs_policy_allow_s3
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
+
+def test_s3_large_body_hashes_are_precomputed_once(monkeypatch):
+    import hashlib as _hashlib
+
+    from ministack.services import s3 as s3_service
+
+    body = b"x" * (1024 * 1024)
+    crc32 = s3_service._compute_s3_checksum("CRC32", body)
+    headers = {
+        "content-md5": base64.b64encode(_hashlib.md5(body).digest()).decode(),
+        "x-amz-checksum-crc32": crc32,
+        "x-amz-sdk-checksum-algorithm": "CRC32",
+    }
+    original_md5 = s3_service.hashlib.md5
+    body_md5_calls = []
+
+    def count_body_md5(value=b"", *args, **kwargs):
+        if value is body:
+            body_md5_calls.append(value)
+        return original_md5(value, *args, **kwargs)
+
+    monkeypatch.setattr(s3_service.hashlib, "md5", count_body_md5)
+    prepared = s3_service._prepare_large_body_hashes(body, headers)
+    assert s3_service._validate_content_md5(headers, body, prepared["md5_digest"]) is None
+    checksums, error = s3_service._resolve_object_checksums(body, headers, prepared)
+
+    assert error is None
+    assert checksums["CRC32"] == crc32
+    assert len(body_md5_calls) == 1
+
+
+def test_s3_large_put_offloads_hashing_before_object_store(monkeypatch):
+    import asyncio
+    import threading
+
+    from ministack.services import s3 as s3_service
+
+    bucket_name = f"large-put-{_uuid_mod.uuid4().hex[:12]}"
+    key = "large.bin"
+    body = b"z" * (1024 * 1024)
+    bucket = {"created": "2026-01-01T00:00:00Z", "objects": {}, "region": "us-east-1"}
+    s3_service._buckets[bucket_name] = bucket
+    original_to_thread = asyncio.to_thread
+    worker_threads = []
+
+    async def observed_to_thread(function, *args, **kwargs):
+        def record_thread(*inner_args, **inner_kwargs):
+            worker_threads.append(threading.current_thread().name)
+            return function(*inner_args, **inner_kwargs)
+
+        return await original_to_thread(record_thread, *args, **kwargs)
+
+    monkeypatch.setattr(s3_service.asyncio, "to_thread", observed_to_thread)
+    headers = {
+        "content-md5": base64.b64encode(hashlib.md5(body).digest()).decode(),
+        "x-amz-sdk-checksum-algorithm": "CRC32",
+    }
+    try:
+        status, _headers, _response_body = asyncio.run(
+            s3_service.handle_request("PUT", f"/{bucket_name}/{key}", headers, body, {})
+        )
+        assert status == 200
+        assert worker_threads and all(name != threading.current_thread().name for name in worker_threads)
+        stored = bucket["objects"][key]
+        assert stored["body"] == body
+        assert stored["checksums"]["CRC32"] == s3_service._compute_s3_checksum("CRC32", body)
+    finally:
+        s3_service._buckets.pop(bucket_name, None)
+
+
+def test_s3_delete_objects_validates_checksum_and_limit_before_mutation():
+    from ministack.services import s3 as s3_service
+
+    bucket_name = f"delete-objects-validation-{_uuid_mod.uuid4().hex[:10]}"
+    bucket = {
+        "created": "2026-01-01T00:00:00Z",
+        "objects": {"existing.txt": {"body": b"keep"}},
+        "region": "us-east-1",
+    }
+    s3_service._buckets[bucket_name] = bucket
+    try:
+        one_object = b"<Delete><Object><Key>existing.txt</Key></Object></Delete>"
+        status, _headers, body = s3_service._delete_objects(bucket_name, one_object, {})
+        assert status == 400
+        assert b"Content-MD5" in body
+        assert "existing.txt" in bucket["objects"]
+
+        too_many = (b"<Delete>" + b"<Object><Key>x</Key></Object>" * 1001 + b"</Delete>")
+        headers = {"content-md5": base64.b64encode(hashlib.md5(too_many).digest()).decode()}
+        status, _headers, body = s3_service._delete_objects(bucket_name, too_many, headers)
+        assert status == 400
+        assert b"1000" in body
+        assert "existing.txt" in bucket["objects"]
+    finally:
+        s3_service._buckets.pop(bucket_name, None)
+
+
+@pytest.mark.parametrize("region", ["us-east-1", "us-west-2"])
+def test_s3_recreate_owned_bucket_obeys_region_exception(region):
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3_service
+
+    name = f"recreate-owned-{_uuid_mod.uuid4().hex[:10]}"
+    configuration = (
+        f"<CreateBucketConfiguration><LocationConstraint>{region}</LocationConstraint>"
+        "</CreateBucketConfiguration>"
+    ).encode()
+    with request_scope("123456789012", region):
+        try:
+            assert s3_service._create_bucket(name, configuration, {"x-amz-acl": "public-read"})[0] == 200
+            original_acl = s3_service._bucket_acl[name]
+            status, _, response = s3_service._create_bucket(name, configuration)
+            if region == "us-east-1":
+                assert status == 200
+                assert "AllUsers" not in s3_service._bucket_acl[name]
+            else:
+                assert status == 409
+                assert b"BucketAlreadyOwnedByYou" in response
+                assert s3_service._bucket_acl[name] == original_acl
+        finally:
+            s3_service._delete_bucket(name)
+
+
+def test_s3_list_max_keys_is_bounded_and_validated():
+    from ministack.services.s3 import _parse_list_max_keys
+
+    assert _parse_list_max_keys({"max-keys": "1500"})[0] == 1000
+    assert _parse_list_max_keys({"max-keys": "0"}) == (0, None)
+    assert _parse_list_max_keys({"max-keys": "invalid"})[1][0] == 400
+    assert _parse_list_max_keys({"max-keys": "-1"})[1][0] == 400
+
 # Last-Modified on S3 HTTP responses must be RFC 7231 HTTP-date (AWS / Smithy).
 _RFC7231_LAST_MODIFIED_RE = re.compile(
     r"^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$"
@@ -25,6 +156,20 @@ def test_s3_create_bucket(s3):
     s3.create_bucket(Bucket="intg-s3-create")
     buckets = s3.list_buckets()["Buckets"]
     assert any(b["Name"] == "intg-s3-create" for b in buckets)
+
+
+def test_s3_create_owned_bucket_from_different_region_is_rejected(s3):
+    bucket = f"owned-region-{_uuid_mod.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=bucket)
+    west = _regional_client("s3", "us-west-2")
+
+    with pytest.raises(ClientError) as exc:
+        west.create_bucket(
+            Bucket=bucket,
+            CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
+        )
+
+    assert exc.value.response["Error"]["Code"] == "BucketAlreadyOwnedByYou"
 
 def test_s3_list_buckets_returns_arn_and_region(s3):
     """ListBuckets should return BucketArn and BucketRegion for each bucket."""
@@ -543,6 +688,27 @@ def test_s3_list_objects_pagination(s3):
         token = resp.get("NextContinuationToken", "")
 
     assert len(all_keys) == 7
+
+
+def test_s3_list_key_index_tracks_copy_and_delete(s3):
+    bkt = f"s3-list-index-{_uuid_mod.uuid4().hex[:12]}"
+    s3.create_bucket(Bucket=bkt)
+    for key in ("z.txt", "m.txt", "a.txt"):
+        s3.put_object(Bucket=bkt, Key=key, Body=b"index")
+
+    first = s3.list_objects_v2(Bucket=bkt, MaxKeys=2)
+    assert [item["Key"] for item in first["Contents"]] == ["a.txt", "m.txt"]
+    tail = s3.list_objects_v2(
+        Bucket=bkt, MaxKeys=2, ContinuationToken=first["NextContinuationToken"]
+    )
+    assert [item["Key"] for item in tail["Contents"]] == ["z.txt"]
+
+    s3.copy_object(
+        CopySource={"Bucket": bkt, "Key": "m.txt"}, Bucket=bkt, Key="n.txt"
+    )
+    s3.delete_object(Bucket=bkt, Key="m.txt")
+    listed = s3.list_objects_v2(Bucket=bkt, StartAfter="a.txt")
+    assert [item["Key"] for item in listed["Contents"]] == ["n.txt", "z.txt"]
 
 def test_s3_delete_objects_batch(s3):
     bkt = "intg-s3-batchdel"
@@ -1202,6 +1368,31 @@ def test_s3_get_object_returns_tag_count(s3):
     s3.put_object(Bucket=bkt, Key="untagged.txt", Body=b"hi")
     resp2 = s3.get_object(Bucket=bkt, Key="untagged.txt")
     assert "TagCount" not in resp2
+
+
+def test_s3_put_rejects_too_many_tags_without_storing_object(s3):
+    bucket = f"s3-tag-limit-{_uuid_mod.uuid4().hex[:12]}"
+    s3.create_bucket(Bucket=bucket)
+    tags = "&".join(f"k{index}=v" for index in range(11))
+
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="rejected.txt", Body=b"must-not-store", Tagging=tags)
+
+    assert exc.value.response["Error"]["Code"] == "BadRequest"
+    with pytest.raises(ClientError) as missing:
+        s3.head_object(Bucket=bucket, Key="rejected.txt")
+    assert missing.value.response["Error"]["Code"] == "404"
+
+
+def test_s3_put_without_tagging_clears_unversioned_object_tags(s3):
+    bucket = f"s3-clear-tags-{_uuid_mod.uuid4().hex[:12]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="overwrite.txt", Body=b"tagged", Tagging="env=qa")
+    assert s3.get_object_tagging(Bucket=bucket, Key="overwrite.txt")["TagSet"]
+
+    s3.put_object(Bucket=bucket, Key="overwrite.txt", Body=b"untagged")
+
+    assert s3.get_object_tagging(Bucket=bucket, Key="overwrite.txt")["TagSet"] == []
 
 
 def test_s3_object_tagging_per_version(s3):
@@ -3770,7 +3961,8 @@ def test_s3_batch_delete_objects_persists_delete_marker(s3_persist, tmp_path):
         b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
         b"<Object><Key>k</Key></Object></Delete>"
     )
-    status, _, _ = s3mod._delete_objects(bucket, body)
+    checksum_headers = {"content-md5": base64.b64encode(hashlib.md5(body).digest()).decode()}
+    status, _, _ = s3mod._delete_objects(bucket, body, checksum_headers)
     assert status == 200
 
     _reload_bucket(s3mod, tmp_path, bucket)

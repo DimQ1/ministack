@@ -9,7 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **SNS**: cache filter policies without persisting caches, avoid retained message history and share scoped publish delivery with EventBridge and Pipes; reject unsupported Pipes SNS FIFO targets before mutation.
+- **S3**: maintain derived listing indexes across mutation and restore paths, validate checksums and tags before mutation, offload large PUT hashes and preserve regional owned-bucket retry behavior.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 
