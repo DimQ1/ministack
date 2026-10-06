@@ -28,6 +28,7 @@ import base64
 import contextvars
 import copy
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -82,34 +83,120 @@ def _wake_queue(q: dict) -> None:
 
 
 def _next_queue_deadline(q: dict, deadline: float) -> float:
+    _ensure_message_indexes(q)
     now = time.time()
-    next_visible = min(
-        (m.get("visible_at", now) for m in q["messages"]
-         if m.get("visible_at", now) > now),
-        default=deadline,
-    )
-    return min(deadline, next_visible)
+    visibility_heap = q["_visibility_heap"]
+    by_id = q["_by_id"]
+    versions = q["_schedule_versions"]
+    next_event = deadline
+    while visibility_heap:
+        visible_at, _, message_id, version = visibility_heap[0]
+        message = by_id.get(message_id)
+        if (message is None or versions.get(message_id) != version
+                or message.get("visible_at") != visible_at):
+            heapq.heappop(visibility_heap)
+            continue
+        next_event = min(next_event, visible_at)
+        break
+
+    expiry_heap = q["_expiry_heap"]
+    expiration_versions = q["_expiration_versions"]
+    while expiry_heap:
+        expires_at, _, message_id, version = expiry_heap[0]
+        message = by_id.get(message_id)
+        if (message is None or expiration_versions.get(message_id) != version
+                or _message_expiry_time(q, message) != expires_at):
+            heapq.heappop(expiry_heap)
+            continue
+        next_event = min(next_event, expires_at)
+        break
+    return max(now, next_event)
 
 
 _NON_PERSISTED_QUEUE_KEYS = {
     "_condition", "_by_id", "_by_rh", "_message_index_size",
+    "_ready_heap", "_visibility_heap", "_schedule_versions",
+    "_fifo_groups", "_fifo_ready_groups", "_fifo_ready_markers",
+    "_fifo_inflight_groups", "_next_message_order", "_redrive_policy",
+    "_message_counts", "_message_states",
+    "_message_positions", "_tombstone_count",
+    "_expiry_heap", "_expiration_versions",
 }
 
 
 def _rebuild_message_indexes(q: dict) -> None:
     by_id: dict = {}
     by_rh: dict = {}
-    messages = q.get("messages", [])
-    for message in messages:
+    ready_heap: list = []
+    visibility_heap: list = []
+    schedule_versions: dict = {}
+    expiry_heap: list = []
+    expiration_versions: dict = {}
+    message_counts = {"visible": 0, "delayed": 0, "inflight": 0}
+    message_states: dict = {}
+    fifo_groups: dict = {}
+    fifo_ready_groups: list = []
+    fifo_inflight_groups: dict = {}
+    messages = q.setdefault("messages", [])
+    if any(message is None for message in messages):
+        messages[:] = [message for message in messages if message is not None]
+    message_positions: dict = {}
+    now = time.time()
+    for order, message in enumerate(messages):
+        _ensure_msg_fields(message)
+        message["_queue_order"] = order
         message_id = message.get("id")
         if message_id is not None:
             by_id.setdefault(message_id, message)
+            message_positions[message_id] = order
+            schedule_versions[message_id] = 1
+            expiration_versions[message_id] = 1
+            heapq.heappush(
+                expiry_heap,
+                (_message_expiry_time(q, message), order, message_id, 1),
+            )
         receipt_handle = message.get("receipt_handle")
         if receipt_handle is not None:
             by_rh.setdefault(receipt_handle, message)
+        visible_at = message.get("visible_at", now)
+        bucket = _message_count_bucket(message, now)
+        message_states[message_id] = bucket
+        message_counts[bucket] += 1
+        if q.get("is_fifo"):
+            group_id = message.get("group_id") or ""
+            heapq.heappush(fifo_groups.setdefault(group_id, []),
+                           (order, message_id))
+            if visible_at > now:
+                heapq.heappush(visibility_heap,
+                               (visible_at, order, message_id, 1))
+            if (visible_at > now and message.get("receive_count", 0) > 0
+                    and group_id):
+                fifo_inflight_groups.setdefault(group_id, message_id)
+        elif visible_at <= now:
+            heapq.heappush(ready_heap, (order, message_id, 1))
+        else:
+            heapq.heappush(visibility_heap,
+                           (visible_at, order, message_id, 1))
     q["_by_id"] = by_id
     q["_by_rh"] = by_rh
+    q["_message_positions"] = message_positions
+    q["_tombstone_count"] = 0
     q["_message_index_size"] = len(messages)
+    q["_ready_heap"] = ready_heap
+    q["_visibility_heap"] = visibility_heap
+    q["_schedule_versions"] = schedule_versions
+    q["_expiry_heap"] = expiry_heap
+    q["_expiration_versions"] = expiration_versions
+    q["_message_counts"] = message_counts
+    q["_message_states"] = message_states
+    q["_fifo_groups"] = fifo_groups
+    q["_fifo_ready_groups"] = fifo_ready_groups
+    q["_fifo_ready_markers"] = {}
+    q["_fifo_inflight_groups"] = fifo_inflight_groups
+    q["_next_message_order"] = len(messages)
+    if q.get("is_fifo"):
+        for group_id in fifo_groups:
+            _refresh_fifo_group(q, group_id, now)
 
 
 def _ensure_message_indexes(q: dict) -> tuple[dict, dict]:
@@ -117,6 +204,10 @@ def _ensure_message_indexes(q: dict) -> tuple[dict, dict]:
         not isinstance(q.get("_by_id"), dict)
         or not isinstance(q.get("_by_rh"), dict)
         or q.get("_message_index_size") != len(q.get("messages", []))
+        or not isinstance(q.get("_ready_heap"), list)
+        or not isinstance(q.get("_visibility_heap"), list)
+        or not isinstance(q.get("_expiry_heap"), list)
+        or not isinstance(q.get("_message_positions"), dict)
     ):
         _rebuild_message_indexes(q)
     return q["_by_id"], q["_by_rh"]
@@ -131,13 +222,26 @@ def _index_message(q: dict, message: dict) -> None:
     receipt_handle = message.get("receipt_handle")
     if receipt_handle is not None:
         by_rh.setdefault(receipt_handle, message)
+    message_id = message.get("id")
+    if message_id is not None:
+        q.setdefault("_message_positions", {})[message_id] = len(q.get("messages", [])) - 1
     q["_message_index_size"] = len(q.get("messages", []))
 
 
 def _append_message(q: dict, message: dict) -> None:
     _ensure_message_indexes(q)
+    order = q.get("_next_message_order", 0)
+    message["_queue_order"] = order
+    q["_next_message_order"] = order + 1
     q["messages"].append(message)
     _index_message(q, message)
+    _set_message_count_state(q, message, _message_count_bucket(message, time.time()))
+    _schedule_expiration(q, message)
+    if q.get("is_fifo"):
+        group_id = message.get("group_id") or ""
+        heapq.heappush(q["_fifo_groups"].setdefault(group_id, []),
+                       (order, message.get("id")))
+    _schedule_message(q, message)
 
 
 def _set_receipt_handle(q: dict, message: dict, receipt_handle: str) -> None:
@@ -154,20 +258,188 @@ def _set_receipt_handle(q: dict, message: dict, receipt_handle: str) -> None:
 
 def _remove_message(q: dict, message: dict) -> bool:
     by_id, by_rh = _ensure_message_indexes(q)
-    try:
-        q["messages"].remove(message)
-    except ValueError:
+    message_id = message.get("id")
+    position = q["_message_positions"].get(message_id)
+    if (position is None or position >= len(q["messages"])
+            or q["messages"][position] is not message):
         _rebuild_message_indexes(q)
+        by_id, by_rh = _ensure_message_indexes(q)
+        position = q["_message_positions"].get(message_id)
+    if (position is None or position >= len(q["messages"])
+            or q["messages"][position] is not message):
         return False
 
-    message_id = message.get("id")
+    q["messages"][position] = None
+    q["_message_positions"].pop(message_id, None)
+    q["_tombstone_count"] += 1
     if message_id is not None and by_id.get(message_id) is message:
         by_id.pop(message_id, None)
     receipt_handle = message.get("receipt_handle")
     if receipt_handle is not None and by_rh.get(receipt_handle) is message:
         by_rh.pop(receipt_handle, None)
-    q["_message_index_size"] = len(q["messages"])
+    _set_message_count_state(q, message, None)
+    q["_schedule_versions"].pop(message_id, None)
+    q["_expiration_versions"].pop(message_id, None)
+    group_id = message.get("group_id") or ""
+    if q.get("is_fifo") and q["_fifo_inflight_groups"].get(group_id) == message_id:
+        q["_fifo_inflight_groups"].pop(group_id, None)
+    if q.get("is_fifo"):
+        q["_fifo_ready_markers"].pop(group_id, None)
+        _refresh_fifo_group(q, group_id, time.time())
+    if not by_id:
+        q["messages"].clear()
+        q["_message_index_size"] = 0
+        q["_message_positions"].clear()
+        q["_tombstone_count"] = 0
+        q["_ready_heap"].clear()
+        q["_visibility_heap"].clear()
+        q["_schedule_versions"].clear()
+        q["_expiry_heap"].clear()
+        q["_expiration_versions"].clear()
+        q["_fifo_groups"].clear()
+        q["_fifo_ready_groups"].clear()
+        q["_fifo_ready_markers"].clear()
+        q["_fifo_inflight_groups"].clear()
+        q["_message_states"].clear()
+        q["_message_counts"] = {"visible": 0, "delayed": 0, "inflight": 0}
+    elif (q["_tombstone_count"] >= 128
+          and q["_tombstone_count"] * 2 >= len(q["messages"])):
+        _rebuild_message_indexes(q)
     return True
+
+
+def _message_count_bucket(message: dict, now: float) -> str:
+    if message.get("visible_at", now) <= now:
+        return "visible"
+    if message.get("receive_count", 0) == 0:
+        return "delayed"
+    return "inflight"
+
+
+def _set_message_count_state(q: dict, message: dict, bucket: str | None) -> None:
+    message_id = message.get("id")
+    if message_id is None:
+        return
+    counts = q.setdefault("_message_counts", {"visible": 0, "delayed": 0, "inflight": 0})
+    states = q.setdefault("_message_states", {})
+    previous = states.pop(message_id, None)
+    if previous is not None:
+        counts[previous] = max(0, counts[previous] - 1)
+    if bucket is not None:
+        states[message_id] = bucket
+        counts[bucket] += 1
+
+
+def _set_message_visibility(q: dict, message: dict, visible_at: float, now: float) -> None:
+    message["visible_at"] = visible_at
+    _set_message_count_state(q, message, _message_count_bucket(message, now))
+
+
+def _schedule_message(q: dict, message: dict) -> None:
+    by_id, _ = _ensure_message_indexes(q)
+    message_id = message.get("id")
+    if message_id is None or by_id.get(message_id) is not message:
+        return
+    versions = q["_schedule_versions"]
+    version = versions.get(message_id, 0) + 1
+    versions[message_id] = version
+    order = message.get("_queue_order", 0)
+    visible_at = message.get("visible_at", time.time())
+    if visible_at > time.time() or message.get("receive_count", 0) > 0:
+        heapq.heappush(q["_visibility_heap"],
+                       (visible_at, order, message_id, version))
+    elif q.get("is_fifo"):
+        _refresh_fifo_group(q, message.get("group_id") or "", time.time())
+    else:
+        heapq.heappush(q["_ready_heap"], (order, message_id, version))
+
+
+def _message_expiry_time(q: dict, message: dict) -> float:
+    try:
+        retention_seconds = int(q.get("attributes", {}).get("MessageRetentionPeriod", "345600"))
+    except (TypeError, ValueError):
+        retention_seconds = 345600
+    return float(message.get("sent_at", time.time())) + retention_seconds
+
+
+def _schedule_expiration(q: dict, message: dict) -> None:
+    message_id = message.get("id")
+    if message_id is None:
+        return
+    versions = q["_expiration_versions"]
+    version = versions.get(message_id, 0) + 1
+    versions[message_id] = version
+    heapq.heappush(
+        q["_expiry_heap"],
+        (_message_expiry_time(q, message), message.get("_queue_order", 0), message_id, version),
+    )
+
+
+def _rebuild_expiry_index(q: dict) -> None:
+    expiry_heap = []
+    expiration_versions = {}
+    for message in q.get("messages", []):
+        if message is None:
+            continue
+        message_id = message.get("id")
+        if message_id is None:
+            continue
+        expiration_versions[message_id] = 1
+        heapq.heappush(
+            expiry_heap,
+            (_message_expiry_time(q, message), message.get("_queue_order", 0), message_id, 1),
+        )
+    q["_expiry_heap"] = expiry_heap
+    q["_expiration_versions"] = expiration_versions
+
+
+def _expire_messages(q: dict, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    _ensure_message_indexes(q)
+    removed_any = False
+    while q["_expiry_heap"] and q["_expiry_heap"][0][0] <= now:
+        expiry_heap = q["_expiry_heap"]
+        versions = q["_expiration_versions"]
+        by_id = q["_by_id"]
+        expires_at, _order, message_id, version = heapq.heappop(expiry_heap)
+        message = by_id.get(message_id)
+        if (message is None or versions.get(message_id) != version
+                or _message_expiry_time(q, message) != expires_at):
+            continue
+        removed_any = _remove_message(q, message) or removed_any
+    if removed_any:
+        _wake_queue(q)
+
+
+def _fifo_group_head(q: dict, group_id: str):
+    group_heap = q["_fifo_groups"].get(group_id, [])
+    by_id = q["_by_id"]
+    while group_heap:
+        order, message_id = group_heap[0]
+        message = by_id.get(message_id)
+        if message is not None:
+            return order, message_id, message
+        heapq.heappop(group_heap)
+    return None
+
+
+def _refresh_fifo_group(q: dict, group_id: str, now: float) -> None:
+    if not q.get("is_fifo") or group_id in q["_fifo_inflight_groups"]:
+        return
+    head = _fifo_group_head(q, group_id)
+    if head is None:
+        q["_fifo_ready_markers"].pop(group_id, None)
+        return
+    order, message_id, message = head
+    if message.get("visible_at", now) > now:
+        return
+    version = q["_schedule_versions"].get(message_id, 0)
+    marker = (message_id, version)
+    if q["_fifo_ready_markers"].get(group_id) == marker:
+        return
+    q["_fifo_ready_markers"][group_id] = marker
+    heapq.heappush(q["_fifo_ready_groups"],
+                   (order, group_id, message_id, version))
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -183,6 +455,13 @@ def get_state():
             key: value for key, value in queue.items()
             if key not in _NON_PERSISTED_QUEUE_KEYS
         }
+        if "messages" in persisted_queue:
+            persisted_queue["messages"] = [
+                {key: value for key, value in message.items()
+                 if key != "_queue_order"}
+                for message in persisted_queue["messages"]
+                if message is not None
+            ]
         queues._data[scoped_key] = copy.deepcopy(persisted_queue)
     return {
         "queues": queues,
@@ -753,6 +1032,7 @@ def _act_send_message(data: dict, qurl: str) -> dict:
             "InvalidMessageContents",
             "The message contains characters outside the allowed set.",
         )
+    msg_attrs = data.get("MessageAttributes") or {}
 
     # AWS SQS rejects messages exceeding the queue's MaximumMessageSize attribute
     # (default 1048576 bytes / 1 MiB, captured eu-north-1 2026-09-19). Real AWS error
@@ -761,8 +1041,8 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         max_size = int(q["attributes"].get("MaximumMessageSize", "1048576"))
     except (TypeError, ValueError):
         max_size = 1048576
-    body_bytes = len(body_text.encode("utf-8"))
-    if body_bytes > max_size:
+    message_bytes = len(body_text.encode("utf-8")) + _message_attributes_size(msg_attrs)
+    if message_bytes > max_size:
         raise _Err(
             "InvalidParameterValue",
             f"One or more parameters are invalid. Reason: Message must be shorter than {max_size} bytes.",
@@ -777,7 +1057,8 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         )
     delay = int(message_delay if message_delay is not None
                 else q["attributes"].get("DelaySeconds", "0"))
-    msg_attrs = data.get("MessageAttributes") or {}
+    if delay < 0 or delay > 900:
+        raise _Err("InvalidParameterValue", "DelaySeconds must be between 0 and 900.")
     sys_attrs = data.get("MessageSystemAttributes") or {}
     group_id = data.get("MessageGroupId")
     dedup_id = data.get("MessageDeduplicationId")
@@ -883,6 +1164,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     msgs: list = []
 
     while True:
+        _expire_messages(q)
         _dlq_sweep(q)
         msgs = _collect_msgs(q, max_n, vis)
         if msgs or time.time() >= deadline:
@@ -909,8 +1191,9 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
         fa = _filter_msg_attrs(m["message_attributes"], msg_attr_names)
         if fa:
             entry["MessageAttributes"] = fa
-            if m["md5_attrs"]:
-                entry["MD5OfMessageAttributes"] = m["md5_attrs"]
+            filtered_md5 = _md5_msg_attrs(fa)
+            if filtered_md5:
+                entry["MD5OfMessageAttributes"] = filtered_md5
         out.append(entry)
 
     return {"Messages": out} if out else {}
@@ -951,7 +1234,9 @@ def _act_change_visibility(data: dict, qurl: str) -> dict:
     message = by_rh.get(rh)
     if message is None or message.get("receipt_handle") != rh:
         raise _Err("ReceiptHandleIsInvalid", "The input receipt handle is invalid.")
-    message["visible_at"] = time.time() + vt
+    now = time.time()
+    _set_message_visibility(q, message, now + vt, now)
+    _schedule_message(q, message)
     _wake_queue(q)
     return {}
 
@@ -1011,7 +1296,9 @@ def _act_change_visibility_batch(data: dict, qurl: str) -> dict:
         _, by_rh = _ensure_message_indexes(q)
         message = by_rh.get(rh)
         if message is not None and message.get("receipt_handle") == rh:
-            message["visible_at"] = time.time() + vt
+            now = time.time()
+            _set_message_visibility(q, message, now + vt, now)
+            _schedule_message(q, message)
             ok.append({"Id": eid})
         else:
             fail.append({
@@ -1049,6 +1336,10 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     _validate_numeric_attrs(incoming)
     for k, v in incoming.items():
         q["attributes"][k] = str(v)
+    if "RedrivePolicy" in incoming:
+        q.pop("_redrive_policy", None)
+    if "MessageRetentionPeriod" in incoming:
+        _rebuild_expiry_index(q)
     q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))
     return {}
 
@@ -1154,11 +1445,25 @@ def _act_remove_permission(data: dict, qurl: str) -> dict:
 def _act_purge_queue(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:PurgeQueue")
+    _ensure_message_indexes(q)
     q["messages"].clear()
     by_id, by_rh = _ensure_message_indexes(q)
     by_id.clear()
     by_rh.clear()
     q["_message_index_size"] = 0
+    q["_message_positions"].clear()
+    q["_tombstone_count"] = 0
+    q["_ready_heap"].clear()
+    q["_visibility_heap"].clear()
+    q["_schedule_versions"].clear()
+    q["_expiry_heap"].clear()
+    q["_expiration_versions"].clear()
+    q["_fifo_groups"].clear()
+    q["_fifo_ready_groups"].clear()
+    q["_fifo_ready_markers"].clear()
+    q["_fifo_inflight_groups"].clear()
+    q["_message_states"].clear()
+    q["_message_counts"] = {"visible": 0, "delayed": 0, "inflight": 0}
     return {}
 
 
@@ -1178,6 +1483,7 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
     _BATCH_MAX_BYTES = 1_048_576
     total_bytes = sum(
         len((e.get("MessageBody") or "").encode("utf-8"))
+        + _message_attributes_size(e.get("MessageAttributes") or {})
         for e in entries
     )
     if total_bytes > _BATCH_MAX_BYTES:
@@ -1366,18 +1672,33 @@ def enqueue_internal(q: dict, body: str, message_attributes: dict | None = None,
                      dedup_id: str | None = None) -> dict:
     """Enqueue an internally delivered message using queue semantics."""
     body = body if isinstance(body, str) else str(body)
+    attrs = message_attributes or {}
     max_size = int(q["attributes"].get("MaximumMessageSize", "1048576"))
-    if len(body.encode("utf-8")) > max_size:
+    if len(body.encode("utf-8")) + _message_attributes_size(attrs) > max_size:
         raise _Err("InvalidParameterValue", "Message exceeds MaximumMessageSize.")
 
     now = time.time()
     seq = None
+    dedup_cache_key = None
     if q["is_fifo"]:
         if not group_id:
             raise _Err("MissingParameter", "MessageGroupId is required.")
+        if not dedup_id:
+            if q["attributes"].get("ContentBasedDeduplication") == "true":
+                dedup_id = hashlib.sha256(body.encode()).hexdigest()
+            else:
+                raise _Err("InvalidParameterValue",
+                           "FIFO delivery requires a MessageDeduplicationId.")
+        dedup_scope = q["attributes"].get("DeduplicationScope", "queue")
+        dedup_cache_key = (
+            f"{group_id}:{dedup_id}" if dedup_scope == "messageGroup" else dedup_id
+        )
+        _prune_dedup(q)
+        cached = q["dedup_cache"].get(dedup_cache_key)
+        if cached:
+            return {"MessageId": cached["id"], "SequenceNumber": cached.get("seq")}
         q["fifo_seq"] += 1
         seq = str(q["fifo_seq"]).zfill(20)
-    attrs = message_attributes or {}
     msg = {
         "id": new_uuid(),
         "body": body,
@@ -1392,27 +1713,31 @@ def enqueue_internal(q: dict, body: str, message_attributes: dict | None = None,
         "sys": _build_send_sys_attrs(now, {}),
         "group_id": group_id,
         "dedup_id": dedup_id,
+        "dedup_cache_key": dedup_cache_key,
         "seq": seq,
     }
     _append_message(q, msg)
     _wake_queue(q)
+    if q["is_fifo"] and dedup_id:
+        q["dedup_cache"][dedup_cache_key] = {
+            "expire": now + _DEDUP_WINDOW_S,
+            "id": msg["id"],
+            "md5": msg["md5_body"],
+            "md5a": msg["md5_attrs"],
+            "seq": seq,
+        }
     return msg
 
 
 def _refresh_counts(q: dict) -> None:
-    """Recompute approximate message counters."""
+    """Refresh counters from scheduled visibility changes without scanning messages."""
     now = time.time()
-    visible = delayed = inflight = 0
-    for m in q["messages"]:
-        if m["visible_at"] <= now:
-            visible += 1
-        elif m["receive_count"] == 0:
-            delayed += 1
-        else:
-            inflight += 1
-    q["attributes"]["ApproximateNumberOfMessages"] = str(visible)
-    q["attributes"]["ApproximateNumberOfMessagesNotVisible"] = str(inflight)
-    q["attributes"]["ApproximateNumberOfMessagesDelayed"] = str(delayed)
+    _expire_messages(q, now)
+    _promote_due_messages(q, now)
+    counts = q["_message_counts"]
+    q["attributes"]["ApproximateNumberOfMessages"] = str(counts["visible"])
+    q["attributes"]["ApproximateNumberOfMessagesNotVisible"] = str(counts["inflight"])
+    q["attributes"]["ApproximateNumberOfMessagesDelayed"] = str(counts["delayed"])
 
 
 # ── Collect visible messages for ReceiveMessage ────────────
@@ -1420,19 +1745,26 @@ def _refresh_counts(q: dict) -> None:
 def _collect_msgs(q: dict, max_n: int, vis_timeout: int) -> list:
     now = time.time()
     _ensure_message_indexes(q)
+    _promote_due_messages(q, now)
     if q["is_fifo"]:
         return _collect_fifo(q, max_n, vis_timeout, now)
-    for m in q["messages"]:
-        _ensure_msg_fields(m)
-        _index_message(q, m)
-    visible = [m for m in q["messages"] if m["visible_at"] <= now]
-    result = visible[:max_n]
-    for m in result:
-        _set_receipt_handle(q, m, new_uuid())
-        m["visible_at"] = now + vis_timeout
-        m["receive_count"] += 1
-        if m.get("first_receive_at") is None:
-            m["first_receive_at"] = now
+    result: list = []
+    ready_heap = q["_ready_heap"]
+    by_id = q["_by_id"]
+    versions = q["_schedule_versions"]
+    while ready_heap and len(result) < max_n:
+        _, message_id, version = heapq.heappop(ready_heap)
+        message = by_id.get(message_id)
+        if (message is None or versions.get(message_id) != version
+                or message.get("visible_at", now) > now):
+            continue
+        _set_receipt_handle(q, message, new_uuid())
+        message["receive_count"] += 1
+        _set_message_visibility(q, message, now + vis_timeout, now)
+        if message.get("first_receive_at") is None:
+            message["first_receive_at"] = now
+        _schedule_message(q, message)
+        result.append(message)
     return result
 
 
@@ -1443,80 +1775,98 @@ def _collect_fifo(q: dict, max_n: int, vis_timeout: int,
     Only one message per group can be in-flight at a time.  Messages within
     a group are delivered in send order.
     """
-    for m in q["messages"]:
-        _ensure_msg_fields(m)
-        _index_message(q, m)
-    inflight_groups: set = {
-        m["group_id"] for m in q["messages"]
-        if m["visible_at"] > now
-        and m["receive_count"] > 0
-        and m["group_id"]
-    }
     result: list = []
-    for m in q["messages"]:
-        if len(result) >= max_n:
-            break
-        if m["visible_at"] > now:
+    ready_heap = q["_fifo_ready_groups"]
+    while ready_heap and len(result) < max_n:
+        order, group_id, message_id, version = heapq.heappop(ready_heap)
+        marker = q["_fifo_ready_markers"].get(group_id)
+        if marker != (message_id, version):
             continue
-        g = m["group_id"]
-        if g in inflight_groups:
+        q["_fifo_ready_markers"].pop(group_id, None)
+        if group_id in q["_fifo_inflight_groups"]:
             continue
-        _set_receipt_handle(q, m, new_uuid())
-        m["visible_at"] = now + vis_timeout
-        m["receive_count"] += 1
-        if m.get("first_receive_at") is None:
-            m["first_receive_at"] = now
-        result.append(m)
+        head = _fifo_group_head(q, group_id)
+        if head is None or head[:2] != (order, message_id):
+            _refresh_fifo_group(q, group_id, now)
+            continue
+        message = head[2]
+        if message.get("visible_at", now) > now:
+            continue
+        _set_receipt_handle(q, message, new_uuid())
+        message["receive_count"] += 1
+        _set_message_visibility(q, message, now + vis_timeout, now)
+        if message.get("first_receive_at") is None:
+            message["first_receive_at"] = now
+        q["_fifo_inflight_groups"][group_id] = message_id
+        _schedule_message(q, message)
+        result.append(message)
     return result
 
 
 # ── Dead-letter queue sweep ────────────────────────────────
 
 def _dlq_sweep(q: dict) -> None:
-    """Move messages that have reached maxReceiveCount to the DLQ."""
-    rp_raw = q["attributes"].get("RedrivePolicy")
-    if not rp_raw:
-        return
+    """Promote only messages whose visibility deadline has elapsed."""
+    _promote_due_messages(q)
+
+
+def _redrive_policy(q: dict) -> dict | None:
+    if "_redrive_policy" in q:
+        return q["_redrive_policy"]
+    raw = q.get("attributes", {}).get("RedrivePolicy")
     try:
-        rp = json.loads(rp_raw)
-    except Exception:
-        return
-    # Belt-and-suspenders: persisted state from older MS versions (pre-fix)
-    # may have stored a double-encoded RedrivePolicy that decodes to a string,
-    # not a dict. CreateQueue/SetQueueAttributes now reject this at intake
-    # (InvalidAttributeValue), but skip rather than crash if a legacy value
-    # slips through.
-    if not isinstance(rp, dict):
-        return
-    try:
-        max_rc = int(rp.get("maxReceiveCount", 0))
+        policy = json.loads(raw) if raw else None
     except (TypeError, ValueError):
-        return
-    arn = rp.get("deadLetterTargetArn", "")
-    if not max_rc or not arn:
-        return
+        policy = None
+    q["_redrive_policy"] = policy if isinstance(policy, dict) else None
+    return q["_redrive_policy"]
 
-    dlq = _queue_by_arn(arn)
-    if dlq is None:
-        return
 
-    now = time.time()
-    keep: list = []
-    moved_any = False
-    for m in q["messages"]:
-        if m["receive_count"] >= max_rc and m["visible_at"] <= now:
-            moved = dict(m)
+def _promote_due_messages(q: dict, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    _ensure_message_indexes(q)
+    visibility_heap = q["_visibility_heap"]
+    by_id = q["_by_id"]
+    versions = q["_schedule_versions"]
+    policy = _redrive_policy(q)
+    try:
+        max_receive_count = int(policy.get("maxReceiveCount", 0)) if policy else 0
+    except (TypeError, ValueError):
+        max_receive_count = 0
+    dlq = _queue_by_arn(policy.get("deadLetterTargetArn", "")) if policy else None
+
+    while visibility_heap and visibility_heap[0][0] <= now:
+        visible_at, order, message_id, version = heapq.heappop(visibility_heap)
+        message = by_id.get(message_id)
+        if (message is None or versions.get(message_id) != version
+                or message.get("visible_at") != visible_at):
+            continue
+        group_id = message.get("group_id") or ""
+        if q.get("is_fifo") and q["_fifo_inflight_groups"].get(group_id) == message_id:
+            q["_fifo_inflight_groups"].pop(group_id, None)
+        if (dlq is not None and max_receive_count > 0
+                and message.get("receive_count", 0) >= max_receive_count):
+            moved = dict(message)
             moved["receipt_handle"] = None
             moved["visible_at"] = now
-            _append_message(dlq, moved)
-            moved_any = True
+            moved["receive_count"] = 0
+            moved["first_receive_at"] = None
+            moved["sys"] = dict(message.get("sys", {}))
+            moved["sys"]["DeadLetterQueueSourceArn"] = q["attributes"]["QueueArn"]
+            if q.get("is_fifo"):
+                moved["sent_at"] = now
+                moved["sys"]["SentTimestamp"] = str(int(now * 1000))
+            if _remove_message(q, message):
+                _append_message(dlq, moved)
+                _wake_queue(dlq)
+            continue
+        _set_message_count_state(q, message, "visible")
+        if q.get("is_fifo"):
+            _refresh_fifo_group(q, group_id, now)
         else:
-            keep.append(m)
-    q["messages"] = keep
-    if moved_any:
-        _rebuild_message_indexes(q)
-        _wake_queue(q)
-        _wake_queue(dlq)
+            _set_message_count_state(q, message, "visible")
+            heapq.heappush(q["_ready_heap"],
+                           (order, message_id, version))
 
 
 # ── FIFO deduplication cache maintenance ───────────────────
@@ -1559,6 +1909,9 @@ def _build_sys_attrs(msg: dict, names: list) -> dict:
         return {}
     want_all = "All" in names
     r: dict = {}
+    source_arn = msg["sys"].get("DeadLetterQueueSourceArn")
+    if source_arn and (want_all or "DeadLetterQueueSourceArn" in names):
+        r["DeadLetterQueueSourceArn"] = source_arn
     if want_all or "SenderId" in names:
         r["SenderId"] = msg["sys"].get("SenderId", get_account_id())
     if want_all or "SentTimestamp" in names:
@@ -1627,6 +1980,25 @@ def _md5_msg_attrs(attrs: dict | None) -> str | None:
             val = (a.get("StringValue") or "").encode("utf-8")
             buf += struct.pack("!I", len(val)) + val
     return hashlib.md5(bytes(buf)).hexdigest()
+
+
+def _message_attributes_size(attrs: dict | None) -> int:
+    total = 0
+    for name, attribute in (attrs or {}).items():
+        total += len(str(name).encode("utf-8"))
+        total += len(str(attribute.get("DataType") or "String").encode("utf-8"))
+        data_type = attribute.get("DataType") or "String"
+        if data_type.startswith("Binary"):
+            value = attribute.get("BinaryValue", b"")
+            if isinstance(value, str):
+                try:
+                    value = base64.b64decode(value)
+                except Exception:
+                    value = value.encode("utf-8")
+            total += len(value)
+        else:
+            total += len(str(attribute.get("StringValue") or "").encode("utf-8"))
+    return total
 
 
 # ────────────────────────────────────────────────────────────
@@ -2116,6 +2488,7 @@ def _receive_messages_for_esm(queue_url: str, max_number: int) -> list[dict]:
         q = _get_q(queue_url)
         max_n = min(int(max_number or 1), 10)
         vis = int(q["attributes"].get("VisibilityTimeout", "30"))
+        _expire_messages(q)
         _dlq_sweep(q)
         return _collect_msgs(q, max_n, vis)
 

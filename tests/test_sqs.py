@@ -21,6 +21,202 @@ from ministack.services import sns as sns_svc
 from ministack.services import sqs as sqs_svc
 
 
+def test_sqs_heap_scheduler_handles_delays_and_fifo_groups():
+    now = time.time()
+
+    def make_message(message_id, group_id=None, visible_at=now):
+        return {
+            "id": message_id,
+            "body": message_id,
+            "md5_body": "",
+            "md5_attrs": None,
+            "receipt_handle": None,
+            "sent_at": now,
+            "visible_at": visible_at,
+            "receive_count": 0,
+            "first_receive_at": None,
+            "message_attributes": {},
+            "sys": {},
+            "group_id": group_id,
+            "dedup_id": None,
+            "seq": None,
+        }
+
+    standard = {"messages": [], "is_fifo": False, "attributes": {}}
+    sqs_svc._append_message(standard, make_message("ready"))
+    sqs_svc._append_message(
+        standard, make_message("delayed", visible_at=now + 0.02))
+    assert [m["id"] for m in sqs_svc._collect_msgs(standard, 10, 60)] == ["ready"]
+    assert sqs_svc._next_queue_deadline(standard, now + 60) <= now + 0.02
+    time.sleep(0.03)
+    assert [m["id"] for m in sqs_svc._collect_msgs(standard, 10, 60)] == ["delayed"]
+
+    fifo = {"messages": [], "is_fifo": True, "attributes": {}}
+    first = make_message("group-a-1", "a")
+    sqs_svc._append_message(fifo, first)
+    sqs_svc._append_message(fifo, make_message("group-a-2", "a"))
+    sqs_svc._append_message(fifo, make_message("group-b-1", "b"))
+    received = sqs_svc._collect_msgs(fifo, 10, 60)
+    assert {m["id"] for m in received} == {"group-a-1", "group-b-1"}
+    assert sqs_svc._remove_message(fifo, first)
+    assert [m["id"] for m in sqs_svc._collect_msgs(fifo, 10, 60)] == ["group-a-2"]
+
+
+def test_sqs_internal_enqueue_applies_queue_delay_and_fifo_dedup():
+    standard = {
+        "messages": [],
+        "is_fifo": False,
+        "attributes": {"DelaySeconds": "30", "MaximumMessageSize": "1048576"},
+    }
+    message = sqs_svc.enqueue_internal(standard, "standard")
+    assert message["visible_at"] - message["sent_at"] == 30
+    assert sqs_svc._next_queue_deadline(standard, time.time() + 60) <= message["visible_at"]
+
+    fifo = {
+        "messages": [],
+        "is_fifo": True,
+        "attributes": {"DelaySeconds": "0", "MaximumMessageSize": "1048576"},
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    first = sqs_svc.enqueue_internal(fifo, "fifo", group_id="group", dedup_id="dedup")
+    duplicate = sqs_svc.enqueue_internal(fifo, "fifo", group_id="group", dedup_id="dedup")
+    assert duplicate["MessageId"] == first["id"]
+    assert duplicate["SequenceNumber"] == first["seq"]
+    assert len(fifo["messages"]) == 1
+    assert fifo["fifo_seq"] == 1
+
+
+def test_sqs_dlq_source_arn_is_a_message_attribute(monkeypatch):
+    dlq = {"messages": [], "is_fifo": False, "attributes": {}}
+    source_arn = "arn:aws:sqs:us-east-1:123456789012:source"
+    source = {
+        "messages": [], "is_fifo": False,
+        "attributes": {
+            "QueueArn": source_arn,
+            "RedrivePolicy": json.dumps({
+                "deadLetterTargetArn": "arn:aws:sqs:us-east-1:123456789012:dlq",
+                "maxReceiveCount": "1",
+            }),
+        },
+    }
+    monkeypatch.setattr(sqs_svc, "_queue_by_arn", lambda arn: dlq)
+    message = sqs_svc.enqueue_internal(source, "redrive")
+    sqs_svc._collect_msgs(source, 1, 0)
+    sqs_svc._promote_due_messages(source)
+    moved = sqs_svc._collect_msgs(dlq, 1, 30)[0]
+    assert sqs_svc._build_sys_attrs(moved, ["DeadLetterQueueSourceArn"]) == {
+        "DeadLetterQueueSourceArn": source_arn,
+    }
+    assert sqs_svc._build_sys_attrs(moved, ["All"])["DeadLetterQueueSourceArn"] == source_arn
+    assert "DeadLetterQueueSourceArn" not in message["sys"]
+    monkeypatch.setattr(sqs_svc, "_get_q", lambda *args: dlq)
+    attributes = sqs_svc._act_get_queue_attributes({"AttributeNames": ["All"]}, "dlq")
+    assert "DeadLetterQueueSourceArn" not in attributes["Attributes"]
+
+
+@pytest.mark.parametrize("fifo", [False, True])
+def test_sqs_dlq_retention_uses_queue_type_timestamp(monkeypatch, fifo):
+    clock = [time.time()]
+    monkeypatch.setattr(sqs_svc.time, "time", lambda: clock[0])
+    dlq = {
+        "messages": [], "is_fifo": fifo,
+        "attributes": {"MessageRetentionPeriod": "60"},
+    }
+    source = {
+        "messages": [], "is_fifo": fifo, "dedup_cache": {}, "fifo_seq": 0,
+        "attributes": {
+            "QueueArn": "arn:aws:sqs:us-east-1:123456789012:source",
+            "RedrivePolicy": json.dumps({
+                "deadLetterTargetArn": "arn:aws:sqs:us-east-1:123456789012:dlq",
+                "maxReceiveCount": "1",
+            }),
+        },
+    }
+    monkeypatch.setattr(sqs_svc, "_queue_by_arn", lambda arn: dlq)
+    message = sqs_svc.enqueue_internal(
+        source, "redrive", group_id="group" if fifo else None,
+        dedup_id="dedup" if fifo else None,
+    )
+    sent_at = message["sent_at"]
+    sqs_svc._collect_msgs(source, 1, 1)
+    clock[0] += 30
+    sqs_svc._promote_due_messages(source)
+    moved = dlq["_by_id"][message["id"]]
+    expected_timestamp = clock[0] if fifo else sent_at
+    assert moved["sent_at"] == expected_timestamp
+    assert moved["sys"]["SentTimestamp"] == str(int(expected_timestamp * 1000))
+    assert message["sent_at"] == sent_at
+    clock[0] = sent_at + 61
+    sqs_svc._expire_messages(dlq)
+    assert bool(dlq["_by_id"]) is fifo
+    clock[0] = sent_at + 91
+    sqs_svc._expire_messages(dlq)
+    assert not dlq["_by_id"]
+
+
+def test_sqs_approximate_counts_follow_scheduler_transitions():
+    queue = {
+        "messages": [],
+        "is_fifo": False,
+        "attributes": {"DelaySeconds": "1"},
+    }
+    message = sqs_svc.enqueue_internal(queue, "counted")
+    now = time.time()
+    sqs_svc._set_message_visibility(queue, message, now + 0.02, now)
+    sqs_svc._schedule_message(queue, message)
+    sqs_svc._refresh_counts(queue)
+    assert queue["attributes"]["ApproximateNumberOfMessagesDelayed"] == "1"
+
+    time.sleep(0.02)
+    sqs_svc._refresh_counts(queue)
+    assert queue["attributes"]["ApproximateNumberOfMessages"] == "1"
+
+    received = sqs_svc._collect_msgs(queue, 1, 0.01)
+    assert received == [message]
+    sqs_svc._refresh_counts(queue)
+    assert queue["attributes"]["ApproximateNumberOfMessagesNotVisible"] == "1"
+
+    assert sqs_svc._remove_message(queue, message)
+    sqs_svc._refresh_counts(queue)
+    assert queue["attributes"]["ApproximateNumberOfMessages"] == "0"
+    assert queue["attributes"]["ApproximateNumberOfMessagesNotVisible"] == "0"
+
+
+def test_sqs_message_retention_heap_expires_only_old_messages():
+    now = time.time()
+    queue = {
+        "messages": [],
+        "is_fifo": False,
+        "attributes": {"MessageRetentionPeriod": "60"},
+    }
+    common = {
+        "body": "body",
+        "md5_body": "",
+        "md5_attrs": None,
+        "receipt_handle": None,
+        "receive_count": 0,
+        "first_receive_at": None,
+        "message_attributes": {},
+        "sys": {},
+        "group_id": None,
+        "dedup_id": None,
+        "seq": None,
+    }
+    old_sent_at = now - 59.5
+    old_message = {**common, "id": "old", "sent_at": old_sent_at, "visible_at": old_sent_at}
+    new_message = {**common, "id": "new", "sent_at": now, "visible_at": now}
+    sqs_svc._append_message(queue, old_message)
+    sqs_svc._append_message(queue, new_message)
+
+    assert sqs_svc._next_queue_deadline(queue, now + 10) < now + 1
+    sqs_svc._expire_messages(queue, now=now + 2)
+
+    assert "old" not in queue["_by_id"]
+    assert queue["_by_id"]["new"] is new_message
+    assert queue["_message_counts"] == {"visible": 1, "delayed": 0, "inflight": 0}
+
+
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -632,9 +828,11 @@ def test_sqs_dlq(sqs):
     dlq_msgs = sqs.receive_message(
         QueueUrl=dlq_url,
         MaxNumberOfMessages=1,
+        AttributeNames=["ApproximateReceiveCount"],
     )
     assert len(dlq_msgs["Messages"]) == 1
     assert dlq_msgs["Messages"][0]["Body"] == "dlq-test"
+    assert dlq_msgs["Messages"][0]["Attributes"]["ApproximateReceiveCount"] == "1"
 
 def test_sqs_delay_seconds(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-delay")["QueueUrl"]
@@ -926,12 +1124,13 @@ def test_sqs_message_indexes_rebuild_from_legacy_state(monkeypatch):
 
 
 def test_sqs_receive_max_10(sqs):
-    """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
+    """ReceiveMessage rejects values above the AWS maximum of 10."""
     url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]
     for i in range(15):
         sqs.send_message(QueueUrl=url, MessageBody=f"msg{i}")
-    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=15)
-    assert len(msgs.get("Messages", [])) <= 10
+    with pytest.raises(ClientError) as exc:
+        sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=15)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
 
 def test_sqs_visibility_timeout_zero_makes_visible(sqs):
     """ChangeMessageVisibility to 0 makes message immediately visible again."""
@@ -1245,6 +1444,38 @@ def test_sqs_send_message_respects_configured_maximum_message_size(sqs):
     assert "1024" in exc.value.response["Error"]["Message"]
 
 
+def test_sqs_message_size_includes_message_attributes(sqs):
+    q = sqs.create_queue(
+        QueueName=f"intg-sqs-attrs-size-{_uuid_mod.uuid4().hex[:8]}",
+        Attributes={"MaximumMessageSize": "1024"},
+    )["QueueUrl"]
+    with pytest.raises(ClientError) as exc:
+        sqs.send_message(
+            QueueUrl=q,
+            MessageBody="x" * 1000,
+            MessageAttributes={
+                "attribute-name": {"DataType": "String", "StringValue": "v" * 32},
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_sqs_attribute_md5_uses_only_returned_attributes(sqs):
+    q = sqs.create_queue(QueueName=f"intg-sqs-attrs-md5-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    sqs.send_message(
+        QueueUrl=q,
+        MessageBody="md5 subset",
+        MessageAttributes={
+            "first": {"DataType": "String", "StringValue": "one"},
+            "second": {"DataType": "String", "StringValue": "two"},
+        },
+    )
+    received = sqs.receive_message(QueueUrl=q, MessageAttributeNames=["first"])["Messages"][0]
+    returned = received["MessageAttributes"]
+    assert set(returned) == {"first"}
+    assert received["MD5OfMessageAttributes"] == sqs_svc._md5_msg_attrs(returned)
+
+
 def test_sqs_add_permission_appends_policy_statement(sqs):
     """AddPermission appends an Allow statement to the queue's Policy
     attribute matching the AWS resource-policy shape."""
@@ -1529,6 +1760,31 @@ def test_sqs_messages_endpoint_separates_same_url_regions(sqs):
     by_region = data["messages"][acct]
     assert [m["Body"] for m in by_region["us-east-1"][admin_east_url]] == ["east-peek"]
     assert [m["Body"] for m in by_region["us-west-2"][admin_west_url]] == ["west-peek"]
+
+
+def test_sqs_messages_endpoint_queue_url_filter_is_scope_independent(monkeypatch):
+    import asyncio
+
+    from ministack import app
+    from ministack.core.responses import AccountRegionScopedDict
+
+    queues = AccountRegionScopedDict()
+    for account in ("111111111111", "222222222222"):
+        url = f"http://localhost:4566/{account}/peek-scope"
+        queues.set_scoped(account, "us-west-2", url, {
+            "name": "peek-scope",
+            "messages": [{"id": account, "body": account}],
+        })
+    monkeypatch.setattr(sqs_svc, "_queues", queues)
+    monkeypatch.setattr(app, "_get_module", lambda name: sqs_svc)
+    alias = "http://ministack:4566/111111111111/peek-scope"
+    status, _, body = asyncio.run(app._handle_sqs_messages_request(
+        "GET", "/_ministack/sqs/messages", {}, {"QueueUrl": [alias]},
+    ))
+    assert status == 200
+    messages = json.loads(body)["messages"]
+    assert list(messages) == ["111111111111"]
+    assert messages["111111111111"]["us-west-2"][alias][0]["Body"] == "111111111111"
 
 
 def test_sqs_messages_endpoint_invalid_account_rejected(sqs):
@@ -2087,7 +2343,8 @@ class TestCrossAccountSns:
         assert _resp_code(_as(ACCT_B, sns_svc._publish, {
             "TopicArn": arn, "Message": "granted"})) == (200, "")
         topic = sns_svc._topic_by_arn_any_scope(arn)
-        assert [m["message"] for m in topic["messages"]] == ["granted"]
+        assert topic["arn"] == arn
+        assert "messages" not in topic
 
     def test_explicit_deny_blocks_same_account(self, auth):
         name = _uniq("xpol-t")

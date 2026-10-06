@@ -3748,25 +3748,9 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
                 return
             target_q = _sqs._queue_by_arn(target_arn)
             if target_q is not None:
-                now = time.time()
-                target_q["messages"].append({
-                    "id": new_uuid(),
-                    "body": body,
-                    "md5_body": hashlib.md5(body.encode()).hexdigest(),
-                    "md5_attrs": "",
-                    "receipt_handle": None,
-                    "sent_at": now,
-                    "visible_at": now,
-                    "receive_count": 0,
-                    "first_receive_at": None,
-                    "message_attributes": {},
-                    "sys": {
-                        "SenderId": get_account_id(),
-                        "SentTimestamp": str(int(now * 1000)),
-                    },
-                    "group_id": None, "dedup_id": None,
-                    "dedup_cache_key": None, "seq": None,
-                })
+                group_id = f"lambda-{func_name}" if target_q.get("is_fifo") else None
+                dedup_id = new_uuid() if target_q.get("is_fifo") else None
+                _sqs.enqueue_internal(target_q, body, {}, group_id, dedup_id)
                 return
         elif spec.service == "sns":
             import ministack.services.sns as _sns
@@ -7403,7 +7387,7 @@ def _poll_sqs():
             if not records:
                 # All records filtered out — treat the batch as processed.
                 for msg in batch:
-                    queue["messages"].remove(msg)
+                    _sqs._remove_message(queue, msg)
                 processed_any = True
                 continue
 
@@ -7669,14 +7653,9 @@ def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, co
             import ministack.services.sqs as _sqs
             target_q = _sqs._queue_by_arn(dest)
             if target_q is not None:
-                target_q["messages"].append({
-                    "id": new_uuid(), "body": body,
-                    "md5_body": hashlib.md5(body.encode()).hexdigest(), "md5_attrs": "",
-                    "receipt_handle": None, "sent_at": now, "visible_at": now,
-                    "receive_count": 0, "first_receive_at": None, "message_attributes": {},
-                    "sys": {"SenderId": get_account_id(), "SentTimestamp": str(int(now * 1000))},
-                    "group_id": None, "dedup_id": None, "dedup_cache_key": None, "seq": None,
-                })
+                group_id = f"lambda-esm-{esm.get('UUID', 'failure')}" if target_q.get("is_fifo") else None
+                dedup_id = new_uuid() if target_q.get("is_fifo") else None
+                _sqs.enqueue_internal(target_q, body, {}, group_id, dedup_id)
         elif spec.service == "sns":
             import ministack.services.sns as _sns
             if dest in _sns._topics:
