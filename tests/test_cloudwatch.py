@@ -7,6 +7,23 @@ from botocore.exceptions import ClientError
 from conftest import sqs_policy_allow_sns
 
 
+def test_cloudwatch_percentiles_require_reconstructible_nonnegative_samples():
+    from ministack.services.cloudwatch import _weighted_percentile
+
+    aggregate = {
+        "Value": 5,
+        "_stat": {"SampleCount": 2, "Sum": 10, "Minimum": 0, "Maximum": 10},
+    }
+    assert _weighted_percentile([aggregate], 50) is None
+    assert _weighted_percentile([{"Value": -1}], 50) is None
+    constant = {
+        "Value": 5,
+        "_stat": {"SampleCount": 1000000, "Sum": 5000000, "Minimum": 5, "Maximum": 5},
+    }
+    assert _weighted_percentile([constant], 99) == 5
+    assert _weighted_percentile([{"Value": 4}], 50) == 4
+
+
 def test_cloudwatch_metrics(cw):
     cw.put_metric_data(
         Namespace="MyApp",
@@ -117,6 +134,46 @@ def test_cloudwatch_get_metric_statistics_v2(cw):
     assert "SampleCount" in dp
     assert "Minimum" in dp
     assert "Maximum" in dp
+
+
+def test_cloudwatch_values_counts_are_stored_as_weighted_points():
+    from ministack.services import cloudwatch as cw_service
+
+    namespace = f"weighted-{_uuid_mod.uuid4().hex[:8]}"
+    key = (namespace, "Weighted", cw_service._dims_key({}))
+    try:
+        cw_service._put_metric_data({}, {
+            "Namespace": namespace,
+            "MetricData": [{
+                "MetricName": "Weighted",
+                "Values": [2.0, 10.0],
+                "Counts": [1_000_000_000, 1],
+            }],
+        }, False, True)
+
+        points = cw_service._metrics[key]
+        stats = cw_service._calc_stats(points)
+        assert len(points) == 2
+        assert stats == {
+            "SampleCount": 1_000_000_001.0,
+            "Sum": 2_000_000_010.0,
+            "Average": 2_000_000_010.0 / 1_000_000_001.0,
+            "Minimum": 2.0,
+            "Maximum": 10.0,
+        }
+        assert cw_service._stat_value(stats, "p99", points) == 2.0
+    finally:
+        cw_service._metrics.pop(key, None)
+
+
+def test_cloudwatch_parse_timestamp_accepts_decoded_datetime():
+    from datetime import datetime, timezone
+
+    from ministack.services.cloudwatch import _parse_ts
+
+    timestamp = datetime(2026, 10, 6, 12, 30, tzinfo=timezone.utc)
+    assert _parse_ts(timestamp) == timestamp.timestamp()
+    assert _parse_ts(timestamp.replace(tzinfo=None)) == timestamp.timestamp()
 
 def test_cloudwatch_put_metric_alarm_v2(cw):
     cw.put_metric_alarm(
