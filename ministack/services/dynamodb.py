@@ -4616,13 +4616,6 @@ def _prune_txn_idempotency() -> None:
         _txn_idempotency.pop(oldest_token, None)
 
 
-def _prune_txn_idempotency() -> None:
-    cutoff = time.time() - 600
-    for token, entry in list(_txn_idempotency.items()):
-        if entry.get("created_at", 0) <= cutoff:
-            _txn_idempotency.pop(token, None)
-
-
 def _transact_get_items(data):
     items_list = data.get("TransactItems", [])
     for _txn_item in items_list if isinstance(items_list, list) else []:
