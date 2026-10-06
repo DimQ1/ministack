@@ -12,6 +12,7 @@ shard per stream; no duplicate storage).
 import base64
 import json
 import logging
+import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import error_response_json, get_account_id, get_region, json_response
@@ -28,6 +29,8 @@ _ITERATOR_TYPES = {
     "AT_SEQUENCE_NUMBER",
     "AFTER_SEQUENCE_NUMBER",
 }
+_ITERATOR_TTL_SECONDS = 15 * 60
+_RECORD_PAGE_MAX_BYTES = 1024 * 1024
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -71,7 +74,12 @@ def _encode_iterator(
     it back unmodified. We base64-url-encode a small JSON payload so it stays
     short enough to fit in AWS's 2 KB iterator limit.
     """
-    payload_data = {"t": table_name, "s": shard_id, "p": position}
+    payload_data = {
+        "t": table_name,
+        "s": shard_id,
+        "p": position,
+        "issued_at": time.time(),
+    }
     if account_id:
         payload_data["a"] = account_id
     if region:
@@ -236,12 +244,19 @@ def _describe_stream(data):
     spec, table_name = source
 
     info = _enabled_stream_info(table_name, account_id=spec.account_id, region=spec.region)
+    closed = None
     if info is None or info["StreamArn"] != stream_arn:
-        return error_response_json(
-            "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
+        closed = _ddb.closed_stream_info(
+            stream_arn, account_id=spec.account_id, region=spec.region
         )
+        if closed is None:
+            return error_response_json(
+                "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
+            )
+        info = closed
 
-    records = _records_for(spec.account_id, spec.region, table_name)
+    records = (closed["records"] if closed is not None
+               else _records_for(spec.account_id, spec.region, table_name))
     starting_seq = records[0]["dynamodb"]["SequenceNumber"] if records else None
 
     shard: dict = {
@@ -250,8 +265,12 @@ def _describe_stream(data):
     }
     if starting_seq:
         shard["SequenceNumberRange"]["StartingSequenceNumber"] = starting_seq
+    if closed is not None and records:
+        shard["SequenceNumberRange"]["EndingSequenceNumber"] = \
+            records[-1]["dynamodb"]["SequenceNumber"]
 
-    table = _ddb._tables.get_scoped(spec.account_id, spec.region, table_name, {})
+    table = (closed if closed is not None else
+             _ddb._tables.get_scoped(spec.account_id, spec.region, table_name, {}))
     key_schema = table.get("KeySchema", [])
 
     # AWS shard pagination: Limit caps the number of Shards returned (max 100),
@@ -259,6 +278,8 @@ def _describe_stream(data):
     # one synthetic shard so this is degenerate, but the fields must be honored
     # for SDK consumers that pass them.
     all_shards = [shard]
+    if (data.get("ShardFilter") or {}).get("Type") == "CHILD_SHARDS":
+        all_shards = []
     start_shard = data.get("ExclusiveStartShardId")
     if start_shard:
         idx = next((i for i, s in enumerate(all_shards) if s["ShardId"] == start_shard), -1)
@@ -269,7 +290,7 @@ def _describe_stream(data):
     description = {
         "StreamArn": stream_arn,
         "StreamLabel": info["StreamLabel"],
-        "StreamStatus": "ENABLED",
+        "StreamStatus": "DISABLED" if closed is not None else "ENABLED",
         "StreamViewType": info["StreamViewType"],
         "CreationRequestDateTime": table.get("CreationDateTime", 0),
         "TableName": table_name,
@@ -304,13 +325,26 @@ def _get_shard_iterator(data):
     spec, table_name = source
 
     info = _enabled_stream_info(table_name, account_id=spec.account_id, region=spec.region)
+    closed = None
     if info is None or info["StreamArn"] != stream_arn:
+        closed = _ddb.closed_stream_info(
+            stream_arn, account_id=spec.account_id, region=spec.region
+        )
+        if closed is None:
+            return error_response_json(
+                "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
+            )
+    if shard_id != _DEFAULT_SHARD_ID:
         return error_response_json(
-            "ResourceNotFoundException", f"Stream not found: {stream_arn}", 400
+            "ResourceNotFoundException", f"Shard not found: {shard_id}", 400
         )
 
-    records = _records_for(spec.account_id, spec.region, table_name)
-    horizon = _horizon(spec.account_id, spec.region, table_name)
+    if closed is not None:
+        records = closed["records"]
+        horizon = closed["horizon"]
+    else:
+        records = _records_for(spec.account_id, spec.region, table_name)
+        horizon = _horizon(spec.account_id, spec.region, table_name)
     position = horizon
     if iterator_type == "TRIM_HORIZON":
         position = horizon
@@ -349,10 +383,14 @@ def _get_shard_iterator(data):
 
 def _get_records(data):
     iterator = data.get("ShardIterator")
-    limit = int(data.get("Limit", 1000) or 1000)
-    if limit <= 0:
-        limit = 1000
-    limit = min(limit, 1000)
+    try:
+        limit = int(data.get("Limit", 1000))
+    except (TypeError, ValueError):
+        return error_response_json("ValidationException", "Limit must be between 1 and 1000", 400)
+    if limit > 1000:
+        return error_response_json("LimitExceededException", "Limit must not exceed 1000", 400)
+    if limit < 1:
+        return error_response_json("ValidationException", "Limit must be between 1 and 1000", 400)
 
     if not iterator:
         return error_response_json("ValidationException", "ShardIterator is required", 400)
@@ -366,6 +404,7 @@ def _get_records(data):
     table_name = decoded["t"]
     shard_id = decoded.get("s", _DEFAULT_SHARD_ID)
     position = int(decoded.get("p", 0))
+    issued_at = decoded.get("issued_at")
     account_id = decoded.get("a", get_account_id())
     region = decoded.get("r", get_region())
     stream_arn = decoded.get("arn")
@@ -374,22 +413,57 @@ def _get_records(data):
         return error_response_json(
             "ValidationException", "ShardIterator is not valid", 400
         )
-
-    info = _enabled_stream_info(table_name, account_id=account_id, region=region)
-    if info is None or (stream_arn and info["StreamArn"] != stream_arn):
+    if shard_id != _DEFAULT_SHARD_ID:
         return error_response_json(
-            "ExpiredIteratorException",
-            "Iterator references a stream that is no longer enabled",
-            400,
+            "ResourceNotFoundException", f"Shard not found: {shard_id}", 400
+        )
+    if (not isinstance(issued_at, (int, float))
+            or time.time() - issued_at >= _ITERATOR_TTL_SECONDS):
+        return error_response_json(
+            "ExpiredIteratorException", "ShardIterator has expired", 400
         )
 
-    # ``position`` is absolute, so an iterator minted before records expired
-    # still lands correctly; one that now points behind the trim horizon
-    # resumes at the horizon rather than skipping live records.
-    position = max(position, _horizon(account_id, region, table_name))
-    page = _ddb.stream_records_since(
-        table_name, position, limit, account_id=account_id, region=region
-    )
+    info = _enabled_stream_info(table_name, account_id=account_id, region=region)
+    closed = None
+    if info is None or (stream_arn and info["StreamArn"] != stream_arn):
+        closed = (_ddb.closed_stream_info(
+            stream_arn, account_id=account_id, region=region
+        ) if stream_arn else None)
+        if closed is None:
+            return error_response_json(
+                "ExpiredIteratorException",
+                "Iterator references a stream that is no longer enabled",
+                400,
+            )
+
+    if closed is not None:
+        horizon = closed["horizon"]
+        if position < horizon:
+            return error_response_json(
+                "TrimmedDataAccessException",
+                "The shard iterator points to data that has been trimmed from the stream",
+                400,
+            )
+        offset = max(0, position - horizon)
+        page = _page_records(closed["records"], offset, limit)
+        result = {"Records": page}
+        if offset + len(page) < len(closed["records"]):
+            result["NextShardIterator"] = _encode_iterator(
+                table_name, shard_id, position + len(page),
+                account_id=account_id, region=region, stream_arn=stream_arn,
+            )
+        return json_response(result)
+
+    horizon = _horizon(account_id, region, table_name)
+    if position < horizon:
+        return error_response_json(
+            "TrimmedDataAccessException",
+            "The shard iterator points to data that has been trimmed from the stream",
+            400,
+        )
+    records = _records_for(account_id, region, table_name)
+    horizon = _horizon(account_id, region, table_name)
+    page = _page_records(records, max(0, position - horizon), limit)
     next_position = position + len(page)
     next_iterator = _encode_iterator(
         table_name,
@@ -404,6 +478,23 @@ def _get_records(data):
         "Records": page,
         "NextShardIterator": next_iterator,
     })
+
+
+def _page_records(records: list[dict], offset: int, limit: int) -> list[dict]:
+    page = []
+    page_bytes = 0
+    for index in range(offset, len(records)):
+        record = records[index]
+        response_record = {key: value for key, value in record.items()
+                           if key != "eventSourceARN"}
+        record_bytes = len(json.dumps(response_record, separators=(",", ":"), default=str).encode("utf-8"))
+        if page and page_bytes + record_bytes > _RECORD_PAGE_MAX_BYTES:
+            break
+        page.append(response_record)
+        page_bytes += record_bytes
+        if len(page) >= limit or page_bytes >= _RECORD_PAGE_MAX_BYTES:
+            break
+    return page
 
 
 # ---------------------------------------------------------------------------
