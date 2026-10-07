@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
 
@@ -1556,6 +1556,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         # AWS ignores trailing slashes when authorizing management resources,
         # as our control-plane handlers do when resolving the target resource.
         resource_path = unquote(path[3:] if path.startswith("/v2/") else path).rstrip("/")
+        if resource_path.startswith("/tags/"):
+            # Tags: ::/tags/{url-encoded-resource-arn} (API Gateway ARN reference).
+            resource_path = "/tags/" + quote(resource_path[len("/tags/"):], safe="")
         return f"arn:aws:apigateway:{region}::{resource_path}"
 
     # --- Bedrock (REST path-based, multiple sub-services) ---
@@ -1673,6 +1676,13 @@ def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list
     return arns
 
 
+def _dynamodb_table_arn(table: str, region: str, account_id: str) -> str:
+    """TableName also accepts the table's ARN."""
+    if table.startswith("arn:"):
+        return table
+    return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+
+
 def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
     """Return every table ARN addressed by a DynamoDB JSON request."""
     try:
@@ -1683,14 +1693,12 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     if isinstance(table, str) and table:
         index = data.get("IndexName")
         suffix = f"/index/{index}" if isinstance(index, str) and index else ""
-        return [
-            f"arn:aws:dynamodb:{region}:{account_id}:table/{table}{suffix}"
-        ]
+        return [_dynamodb_table_arn(table, region, account_id) + suffix]
     else:
         request_items = data.get("RequestItems") if isinstance(data, dict) else None
         tables = list(request_items) if isinstance(request_items, dict) else []
     return [
-        f"arn:aws:dynamodb:{region}:{account_id}:table/{name}"
+        _dynamodb_table_arn(name, region, account_id)
         for name in tables
         if isinstance(name, str) and name
     ]
@@ -1776,7 +1784,7 @@ def dynamodb_transaction_checks(
             detail = item.get(member)
             table = detail.get("TableName") if isinstance(detail, dict) else None
             if isinstance(table, str) and table:
-                checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"))
+                checks.append((action, _dynamodb_table_arn(table, region, account_id)))
     return checks
 
 
