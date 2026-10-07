@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 import pytest
 from botocore.exceptions import ClientError
 
+from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     AuthError,
@@ -1394,6 +1395,17 @@ class TestResourceArn:
             "arn:aws:dynamodb:us-east-1:123:table/snapshots",
         ]
 
+    def test_dynamodb_table_name_may_be_the_table_arn(self):
+        from ministack.core.iam_actions import dynamodb_resource_arns, dynamodb_transaction_checks
+        arn = "arn:aws:dynamodb:us-east-1:123:table/users"
+        assert dynamodb_resource_arns(json.dumps({"TableName": arn, "IndexName": "by-email"}).encode(),
+                                      "us-east-1", "123") == [f"{arn}/index/by-email"]
+        assert dynamodb_resource_arns(json.dumps({"RequestItems": {arn: []}}).encode(),
+                                      "us-east-1", "123") == [arn]
+        body = json.dumps({"TransactItems": [{"Put": {"TableName": arn, "Item": {}}}]}).encode()
+        assert dynamodb_transaction_checks("dynamodb:TransactWriteItems", body, "us-east-1", "123") == [
+            ("dynamodb:PutItem", arn)]
+
     def test_eventbridge_put_events_returns_every_bus(self):
         from ministack.core.iam_actions import eventbridge_resource_arns
         body = json.dumps({"Entries": [
@@ -1655,6 +1667,17 @@ class TestResourceArn:
         assert extract_resource_arn("signer", "PUT", "/signing-profiles/fleet", {}, b"{}", {}, "us-east-1", "123") == "*"
         assert extract_resource_arn("signer", "GET", "/signing-jobs", {}, b"", {"status": "Succeeded"}, "us-east-1", "123") == "*"
         assert extract_resource_arn("signer", "POST", "/signing-jobs", {}, b"not json", {}, "us-east-1", "123") == "*"
+
+    def test_signer_cancel_and_profile_permissions(self):
+        """CancelSigningProfile and the three profile-permission actions
+        are scoped to the signing profile."""
+        from ministack.core.iam_actions import extract_resource_arn
+        arn = "arn:aws:signer:us-east-1:123:/signing-profiles/fleet"
+        for method, path in (("DELETE", "/signing-profiles/fleet"),
+                             ("POST", "/signing-profiles/fleet/permissions"),
+                             ("GET", "/signing-profiles/fleet/permissions"),
+                             ("DELETE", "/signing-profiles/fleet/permissions/s1")):
+            assert extract_resource_arn("signer", method, path, {}, b"{}", {}, "us-east-1", "123") == arn
 
     def test_elb_passthrough_arn(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2590,6 +2613,176 @@ class TestBedrockAgentCoreAuthorization:
             region="eu-central-1",
         )
         assert evaluate(ctx, [stmts]).decision == decision
+
+
+class TestDynamoDBTransactionAuthorization:
+    """TransactWriteItems / TransactGetItems are authorised per item."""
+
+    _TABLE = "arn:aws:dynamodb:us-east-1:000000000000:table/repro"
+
+    @staticmethod
+    def _transact(monkeypatch, target, items_key, items, actions, resource="*", policy=None):
+        import asyncio
+
+        import ministack.app as app_mod
+        from ministack.core import iam_evaluator
+
+        statements = parse_policy_document(policy or {"Statement": [{
+            "Effect": "Allow", "Action": actions, "Resource": resource,
+        }]})
+        seen = []
+        handled = []
+
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
+            seen.append((iam_action, resource_arn))
+            ctx = _ctx(action=iam_action, resource=resource_arn)
+            ctx.service_context = {k.lower(): v for k, v in (service_context or {}).items()}
+            result = evaluate(ctx, [statements])
+            if result.decision == "Allow":
+                return None
+            result.principal_arn = "arn:aws:iam::000000000000:user/testuser"
+            return result
+
+        async def handler(method, request_path, headers, body, query):
+            handled.append(True)
+            return 200, {"Content-Type": "application/x-amz-json-1.0"}, b"{}"
+
+        monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+        monkeypatch.setattr(iam_evaluator, "enforce", enforce_stub)
+        monkeypatch.setitem(app_mod.SERVICE_HANDLERS, "dynamodb", handler)
+        headers = {
+            **_sigv4_headers("dynamodb", "dynamodb.us-east-1.amazonaws.com"),
+            "host": "dynamodb.us-east-1.amazonaws.com",
+            "x-amz-target": f"DynamoDB_20120810.{target}",
+            "content-type": "application/x-amz-json-1.0",
+        }
+        headers["authorization"] = headers["authorization"].replace(
+            "20260101/eu-central-1/", "20260101/us-east-1/"
+        )
+        body = json.dumps({items_key: items}).encode()
+        response = asyncio.run(
+            app_mod._dispatch_service_request("POST", "/", headers, body, {}, "req-ddb-tx")
+        )
+        return response, seen, handled
+
+    _WRITE = [
+        {"ConditionCheck": {"TableName": "repro", "Key": {"pk": {"S": "guard"}},
+                            "ConditionExpression": "attribute_exists(pk)"}},
+        {"Put": {"TableName": "repro", "Item": {"pk": {"S": "written"}}}},
+    ]
+
+    def test_write_is_allowed_by_the_per_item_actions(self, monkeypatch):
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE,
+            ["dynamodb:ConditionCheckItem", "dynamodb:PutItem"],
+        )
+        assert response[0] == 200
+        assert handled
+        assert seen == [
+            ("dynamodb:ConditionCheckItem", self._TABLE),
+            ("dynamodb:PutItem", self._TABLE),
+        ]
+
+    def test_write_without_condition_check_permission_is_denied(self, monkeypatch):
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE,
+            ["dynamodb:TransactWriteItems", "dynamodb:PutItem"],
+        )
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert b"dynamodb:ConditionCheckItem" in response[2]
+        assert not handled
+
+    def test_update_and_delete_map_to_their_own_actions(self, monkeypatch):
+        items = [
+            {"Update": {"TableName": "repro", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :x"}},
+            {"Delete": {"TableName": "repro", "Key": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, _ = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items,
+            ["dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+        )
+        assert response[0] == 200
+        assert [a for a, _ in seen] == ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+
+    def test_item_naming_several_members_is_checked_for_each(self, monkeypatch):
+        # AWS rejects an item with two members; the handler does not, so the
+        # second member must not run unchecked behind an allowed first one.
+        items = [{
+            "Update": {"TableName": "repro", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :x"},
+            "Delete": {"TableName": "repro", "Key": {"pk": {"S": "a"}}},
+        }]
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items, ["dynamodb:UpdateItem"],
+        )
+        assert [a for a, _ in seen] == ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+        assert response[0] == 403
+        assert b"dynamodb:DeleteItem" in response[2]
+        assert not handled
+
+    def test_denial_on_a_later_table_refuses_the_whole_transaction(self, monkeypatch):
+        items = [
+            {"Put": {"TableName": "repro", "Item": {"pk": {"S": "a"}}}},
+            {"Put": {"TableName": "other", "Item": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items, ["dynamodb:PutItem"],
+            resource=self._TABLE,
+        )
+        assert [r for _, r in seen] == [self._TABLE, self._TABLE.replace("repro", "other")]
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert not handled
+
+    def test_get_is_authorised_per_item_on_its_own_table(self, monkeypatch):
+        items = [
+            {"Get": {"TableName": "repro", "Key": {"pk": {"S": "a"}}}},
+            {"Get": {"TableName": "other", "Key": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, _ = self._transact(
+            monkeypatch, "TransactGetItems", "TransactItems", items, ["dynamodb:GetItem"],
+        )
+        assert response[0] == 200
+        assert seen == [
+            ("dynamodb:GetItem", self._TABLE),
+            ("dynamodb:GetItem", self._TABLE.replace("repro", "other")),
+        ]
+
+    _ITEM_ACTIONS = ["dynamodb:ConditionCheckItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                     "dynamodb:DeleteItem", "dynamodb:GetItem"]
+    _ENCLOSING = {"ForAnyValue:StringEquals": {
+        "dynamodb:EnclosingOperation": ["TransactWriteItems", "TransactGetItems"]}}
+
+    def test_allow_only_transactional_operations(self, monkeypatch):
+        """Example 2 of the DynamoDB transactions IAM guide."""
+        policy = {"Statement": [{"Effect": "Allow", "Action": self._ITEM_ACTIONS,
+                                 "Resource": "*", "Condition": self._ENCLOSING}]}
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE, [], policy=policy)
+        assert response[0] == 200 and handled
+
+    def test_deny_transactional_operations(self, monkeypatch):
+        """Example 3 of the DynamoDB transactions IAM guide."""
+        policy = {"Statement": [
+            {"Effect": "Deny", "Action": self._ITEM_ACTIONS, "Resource": "*",
+             "Condition": self._ENCLOSING},
+            {"Effect": "Allow", "Action": self._ITEM_ACTIONS, "Resource": "*"},
+        ]}
+        response, _, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE, [], policy=policy)
+        assert response[0] == 403 and not handled
+
+    def test_get_with_only_the_whole_operation_action_is_denied(self, monkeypatch):
+        items = [{"Get": {"TableName": "repro", "Key": {"pk": {"S": "a"}}}}]
+        response, _, handled = self._transact(
+            monkeypatch, "TransactGetItems", "TransactItems", items,
+            ["dynamodb:TransactGetItems"],
+        )
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert b"dynamodb:GetItem" in response[2]
+        assert not handled
 
 
 class TestS3ActionMapping:
@@ -4187,3 +4380,104 @@ def test_access_denied_message_names_an_explicit_deny(service, action, explicit_
         service, action, "arn:aws:iam::000000000000:user/u", "req-1", explicit_deny=explicit_deny)
     expected = f"User: arn:aws:iam::000000000000:user/u is not authorized to perform: {action} "
     assert (expected + reason.format(action=action)) in body.decode()
+
+
+# ── API Gateway management actions and resource paths ──
+
+
+@pytest.mark.parametrize("path", ["/restapis/api/stages/prod", "/v2/apis/api/stages/prod"])
+@pytest.mark.parametrize("method", ["GET", "POST", "PUT", "PATCH", "DELETE"])
+def test_management_actions_use_http_verbs(path, method):
+    # Neither query-protocol parameters nor JSON-protocol headers may override
+    # the action of this REST-only service.
+    assert extract_iam_action(
+        "apigateway", method, path,
+        {"x-amz-target": "ApiGateway.GetStage"}, b"", {"Action": "GetStage"},
+    ) == f"apigateway:{method}"
+
+
+@pytest.mark.parametrize("path, resource", [
+    ("/restapis", "/restapis"),
+    ("/restapis/api", "/restapis/api"),
+    ("/restapis/api/stages", "/restapis/api/stages"),
+    ("/restapis/api/stages/prod", "/restapis/api/stages/prod"),
+    ("/restapis/api/stages/prod/", "/restapis/api/stages/prod"),
+    ("/restapis/api/stages/", "/restapis/api/stages"),
+    ("/restapis/api/resources/root/methods/GET/integration", "/restapis/api/resources/root/methods/GET/integration"),
+    ("/v2/apis", "/apis"),
+    ("/v2/apis/api", "/apis/api"),
+    ("/v2/apis/api/stages", "/apis/api/stages"),
+    ("/v2/apis/api/stages/", "/apis/api/stages"),
+    ("/v2/apis/api/stages/prod/", "/apis/api/stages/prod"),
+    ("/v2/apis/api/stages/%24default", "/apis/api/stages/$default"),
+    ("/v2/apis/api/stages/%24default/", "/apis/api/stages/$default"),
+    ("/v2/apis/api/routes/route", "/apis/api/routes/route"),
+    ("/domainnames/example.com/basepathmappings", "/domainnames/example.com/basepathmappings"),
+    ("/v2/domainnames/example.com/apimappings", "/domainnames/example.com/apimappings"),
+    ("/account", "/account"),
+    ("/tags/arn:aws:apigateway:us-east-2::/restapis/api",
+     "/tags/arn%3Aaws%3Aapigateway%3Aus-east-2%3A%3A%2Frestapis%2Fapi"),
+    ("/tags/arn%3Aaws%3Aapigateway%3Aus-east-2%3A%3A%2Frestapis%2Fapi",
+     "/tags/arn%3Aaws%3Aapigateway%3Aus-east-2%3A%3A%2Frestapis%2Fapi"),
+    ("/v2/tags/arn:aws:apigateway:us-east-2::/apis/api",
+     "/tags/arn%3Aaws%3Aapigateway%3Aus-east-2%3A%3A%2Fapis%2Fapi"),
+])
+def test_management_resource_preserves_path(path, resource):
+    assert extract_resource_arn(
+        "apigateway", "GET", path, {}, b"", {}, "us-east-2", "000000000000",
+    ) == f"arn:aws:apigateway:us-east-2::{resource}"
+
+
+@pytest.mark.parametrize("prefix", ["/restapis/api", "/v2/apis/api"])
+@pytest.mark.parametrize("suffix", ["", "/"])
+@pytest.mark.parametrize("case, method, stage, expected", [
+    ("stage-grant", "GET", "prod", 200),
+    ("stage-grant", "PATCH", "prod", 200),
+    ("stage-grant", "GET", "dev", 403),
+    ("parent-grant", "GET", "prod", 403),
+    ("operation-grant", "GET", "prod", 403),
+    ("stage-deny", "GET", "prod", 403),
+    ("stage-deny", "GET", "dev", 200),
+])
+def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case, method, stage, expected):
+    import ministack.app as app
+    from ministack.core import iam_evaluator
+
+    parent = f"arn:aws:apigateway:us-east-2::{prefix.removeprefix('/v2')}"
+    grants = {
+        "stage-grant": [{"Effect": "Allow", "Action": ["apigateway:GET", "apigateway:PATCH"],
+                         "Resource": f"{parent}/stages/prod"}],
+        "parent-grant": [{"Effect": "Allow", "Action": "apigateway:GET", "Resource": parent}],
+        "operation-grant": [{"Effect": "Allow", "Action": "apigateway:GetStage", "Resource": "*"}],
+        "stage-deny": [
+            {"Effect": "Allow", "Action": "apigateway:*", "Resource": f"{parent}/*"},
+            {"Effect": "Deny", "Action": "apigateway:GET", "Resource": f"{parent}/stages/prod"},
+        ],
+    }
+    statements = parse_policy_document({"Statement": grants[case]})
+    dispatched = []
+
+    def enforce_policy(access_key, action, service, region, resource_arn="*", service_context=None):
+        result = evaluate(EvalContext(
+            principal_arn="arn:aws:iam::000000000000:user/caller",
+            principal_type="User", principal_account="000000000000",
+            action=action, resource_arn=resource_arn, region=region,
+        ), [statements])
+        return None if result.decision == "Allow" else result
+
+    async def handler(*args):
+        dispatched.append(args)
+        return 200, {}, b"{}"
+
+    monkeypatch.setattr(app, "AUTH", True)
+    monkeypatch.setattr(iam_evaluator, "enforce", enforce_policy)
+    monkeypatch.setattr(iam_evaluator, "pin_request_caller", lambda *args: None)
+    monkeypatch.setitem(app.SERVICE_HANDLERS, "apigateway", handler)
+    headers = {"authorization": "AWS4-HMAC-SHA256 Credential=test/20261006/us-east-2/apigateway/aws4_request"}
+    status, _, body = asyncio.run(app._dispatch_service_request(
+        method, f"{prefix}/stages/{stage}{suffix}", headers, b"", {}, "request-stage",
+    ))
+    assert status == expected
+    assert bool(dispatched) == (expected == 200)
+    if expected == 403:
+        assert f"apigateway:{method}" in json.loads(body)["message"]
